@@ -4,8 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { ensureRuntimeDirs, loadConfig, validateConfig } from './config';
-import { collectCursorRules, detectMcpServers } from './cursorRunner';
+import type { ValidationIssue } from './config';
+import { collectCursorRules } from './cursorRunner';
 import { closeLogger, configureLogger, createLogger } from './logger';
+import { formatProbeResult, loadMcpServers, probeMcpServers } from './mcpProbe';
+import type { McpProbeResult } from './mcpProbe';
 import { loadState } from './memoryManager';
 import { Orchestrator } from './orchestrator';
 import { loadRoadmap } from './roadmap';
@@ -57,7 +60,7 @@ Commands:
   run          roadmap.json 기준으로 파이프라인을 실행합니다 (기본값)
   init         대상 프로젝트에 docs/spec.md, docs/roadmap.json 템플릿을 생성합니다
   status       state.json 기반 진행 상황을 출력합니다
-  doctor       설정/환경(Unity, cursor-agent, .cursorrules, MCP)을 점검합니다
+  doctor       설정/환경을 점검하고 MCP 서버에 실제로 접속해 응답을 확인합니다
   help         이 도움말을 출력합니다
 
 Options:
@@ -69,11 +72,14 @@ Options:
   --no-commit        자동 커밋 비활성화
   --dry-run          Agent 를 실행하지 않고 프롬프트 구성만 확인
   --debug            로그 레벨을 debug 로 설정
+  --no-mcp-probe     MCP 서버 실제 접속 점검을 생략 (doctor, run)
+  --mcp-timeout <ms> MCP 응답 대기 시간 (기본 20000)
 
 예시:
   cursor-auto-work run --project D:\\UnityProjects\\MyGame
   cursor-auto-work run --from 3 --tests
   cursor-auto-work doctor
+  cursor-auto-work doctor --mcp-timeout 40000
 `.trimStart(),
   );
 }
@@ -207,10 +213,42 @@ function commandStatus(config: OrchestratorConfig): void {
   process.stdout.write(lines.join('\n'));
 }
 
-function commandDoctor(config: OrchestratorConfig): number {
+/** 프로브 결과를 doctor 이슈 목록으로 환산한다. 연결 실패는 치명적이지 않지만 반드시 눈에 띄어야 한다. */
+function mcpIssues(results: McpProbeResult[]): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+
+  if (results.length === 0) {
+    issues.push({
+      fatal: false,
+      message:
+        'mcp.json 에 등록된 MCP 서버가 없습니다 - Agent 가 Unity Editor 를 직접 조작할 수 없습니다.',
+    });
+    return issues;
+  }
+
+  for (const result of results) {
+    if (result.skipped) continue;
+    if (!result.ok) {
+      issues.push({
+        fatal: false,
+        message: `MCP '${result.name}' 응답 없음: ${result.error ?? '알 수 없는 실패'}`,
+      });
+    } else if (result.warning) {
+      issues.push({ fatal: false, message: `MCP '${result.name}': ${result.warning}` });
+    }
+  }
+
+  return issues;
+}
+
+async function commandDoctor(
+  config: OrchestratorConfig,
+  flags: ParsedArgs['flags'],
+): Promise<number> {
   const issues = validateConfig(config);
   const rules = collectCursorRules(config.targetProjectPath);
-  const mcpServers = detectMcpServers(config.targetProjectPath);
+  const servers = loadMcpServers(config.targetProjectPath);
+  const skipProbe = flags['no-mcp-probe'] === true;
 
   const lines = [
     '',
@@ -223,11 +261,23 @@ function commandDoctor(config: OrchestratorConfig): number {
     `로드맵          : ${config.roadmapPath}`,
     `상태 파일       : ${config.statePath}`,
     `규칙 주입       : ${rules ? `${rules.length} chars` : '없음'}`,
-    `MCP 서버        : ${mcpServers.length > 0 ? mcpServers.join(', ') : '없음'}`,
+    `MCP 등록        : ${servers.length > 0 ? servers.map((s) => `${s.name}(${s.scope})`).join(', ') : '없음'}`,
     `Discord 알림    : ${config.discordWebhookUrl ? '활성' : '비활성'}`,
     `최대 재시도     : ${config.maxRetries}`,
     '',
   ];
+
+  if (skipProbe) {
+    lines.push('=== MCP 연결 점검 ===', '  (--no-mcp-probe 로 건너뜀)', '');
+  } else {
+    const timeoutMs = numberFlag(flags, 'mcp-timeout') ?? 20_000;
+    lines.push('=== MCP 연결 점검 (initialize + tools/list 실제 호출) ===');
+    const results = await probeMcpServers(config.targetProjectPath, timeoutMs);
+    if (results.length === 0) lines.push('  등록된 서버 없음');
+    for (const result of results) lines.push(...formatProbeResult(result));
+    lines.push('');
+    issues.push(...mcpIssues(results));
+  }
 
   if (issues.length === 0) {
     lines.push('문제 없음. `run` 을 실행할 수 있습니다.', '');
@@ -252,6 +302,19 @@ async function commandRun(config: OrchestratorConfig, flags: ParsedArgs['flags']
   if (issues.some((issue) => issue.fatal)) {
     log.error('치명적 설정 문제로 실행을 중단합니다. `doctor` 명령으로 확인하세요.');
     return 1;
+  }
+
+  if (flags['no-mcp-probe'] !== true) {
+    const results = await probeMcpServers(
+      config.targetProjectPath,
+      numberFlag(flags, 'mcp-timeout') ?? 20_000,
+    );
+    for (const result of results) {
+      if (result.skipped) continue;
+      if (!result.ok) log.warn(`MCP '${result.name}' 응답 없음: ${result.error}`);
+      else if (result.warning) log.warn(`MCP '${result.name}': ${result.warning}`);
+      else log.info(`MCP '${result.name}' 정상 (도구 ${result.toolCount ?? 0}개)`);
+    }
   }
 
   const orchestrator = new Orchestrator(config);
@@ -304,7 +367,7 @@ async function main(): Promise<void> {
       commandStatus(config);
       break;
     case 'doctor':
-      process.exitCode = commandDoctor(config);
+      process.exitCode = await commandDoctor(config, flags);
       break;
     case 'run':
       process.exitCode = await commandRun(config, flags);

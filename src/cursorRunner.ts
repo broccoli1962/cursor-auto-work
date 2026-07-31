@@ -41,22 +41,6 @@ export function collectCursorRules(projectRoot: string, maxChars = 12_000): stri
     : joined;
 }
 
-/** `.cursor/mcp.json` 에 등록된 MCP 서버 이름들을 확인한다 (UnityMCP 연결 점검용). */
-export function detectMcpServers(projectRoot: string): string[] {
-  const mcpPath = path.join(projectRoot, '.cursor', 'mcp.json');
-  if (!fs.existsSync(mcpPath)) return [];
-  try {
-    const parsed = JSON.parse(fs.readFileSync(mcpPath, 'utf8')) as {
-      mcpServers?: Record<string, unknown>;
-      servers?: Record<string, unknown>;
-    };
-    return Object.keys(parsed.mcpServers ?? parsed.servers ?? {});
-  } catch (error) {
-    log.warn(`.cursor/mcp.json 파싱 실패: ${(error as Error).message}`);
-    return [];
-  }
-}
-
 export interface RunAgentOptions {
   prompt: string;
   config: OrchestratorConfig;

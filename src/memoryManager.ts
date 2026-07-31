@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { collectCursorRules, detectMcpServers } from './cursorRunner';
+import { collectCursorRules } from './cursorRunner';
 import { createLogger } from './logger';
+import { listMcpServerNames } from './mcpProbe';
 import type {
   AgentRunResult,
   OrchestratorConfig,
@@ -154,7 +155,7 @@ export function buildStepPrompt(args: BuildPromptArgs): string {
   const { config, state, step, totalSteps, feedback, attempt } = args;
 
   const rules = collectCursorRules(config.targetProjectPath);
-  const mcpServers = detectMcpServers(config.targetProjectPath);
+  const mcpServers = listMcpServerNames(config.targetProjectPath);
   const spec = readSpec(config);
 
   const sections: string[] = [];

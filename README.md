@@ -122,14 +122,35 @@ node dist/index.js init --project D:\UnityProjects\MyGame
 ### 4-2. `.cursorrules` 와 UnityMCP
 
 - 대상 프로젝트 루트의 `.cursorrules`, `.cursor/rules/*.mdc`, `AGENTS.md` 는 **매 CLI 실행마다 프롬프트 최상단 System Context로 주입**됩니다. C# 스타일, UniTask/Addressables 사용 원칙, MVP 패턴 강제 등을 여기에 작성하세요.
-- `.cursor/mcp.json` 에 UnityMCP가 등록되어 있으면 자동 감지되어, Agent에게 "Editor 조작이 필요하면 MCP 도구를 직접 호출하라"는 지침이 함께 주입됩니다. 도구 호출 승인은 `CURSOR_YOLO=true`(`--force`)로 자동 처리됩니다.
+- UnityMCP가 등록되어 있으면 자동 감지되어, Agent에게 "Editor 조작이 필요하면 MCP 도구를 직접 호출하라"는 지침이 함께 주입됩니다. 도구 호출 승인은 `CURSOR_YOLO=true`(`--force`)로 자동 처리됩니다.
+- MCP 설정은 Cursor와 동일하게 전역 `~/.cursor/mcp.json` 과 프로젝트 `.cursor/mcp.json` 을 병합해서 읽습니다. 같은 이름이 양쪽에 있으면 프로젝트 설정이 우선합니다.
+
+### 4-3. MCP가 실제로 살아 있는지 확인하기
+
+`doctor` 는 설정 파일에 이름이 적혀 있는지만 보지 않고, 등록된 모든 MCP 서버에 **직접 접속해 JSON-RPC `initialize` → `tools/list` 핸드셰이크를 수행**합니다. HTTP(Streamable HTTP/SSE)와 stdio 두 방식 모두 지원합니다.
+
+```powershell
+node dist/index.js doctor
+```
+
+```
+=== MCP 연결 점검 (initialize + tools/list 실제 호출) ===
+  [ OK ] unityMCP (global, http) - mcp-for-unity-server 3.4.5 · 도구 48개 · 47ms
+         Unity 인스턴스: AutoRpg@30a4666de7d51ef1
+  [ OK ] mcp-gsheets (global, stdio) - spreadsheet 1.8.0 · 도구 44개 · 2406ms
+```
+
+- `[ OK ]` 는 서버가 지금 응답하고 있고 도구 목록까지 받아왔다는 뜻입니다.
+- UnityMCP는 서버가 떠 있어도 Unity Editor가 붙어 있지 않으면 도구 호출이 실패하므로, `mcpforunity://instances` 리소스를 추가로 읽어 **연결된 Editor 인스턴스**까지 표시합니다. 인스턴스가 없으면 경고가 뜹니다.
+- 응답하지 않는 서버는 `[FAIL]` 과 원인(`ECONNREFUSED`, 타임아웃, 프로세스 종료 stderr 등)이 함께 출력되고, `[WARN]` 이슈로 요약됩니다. 종료 코드는 기존 `FATAL` 이슈 기준을 유지합니다.
+- `run` 도 시작 직전 같은 점검을 수행해 로그에 남깁니다. 점검을 건너뛰려면 `--no-mcp-probe`, 대기 시간을 늘리려면 `--mcp-timeout <ms>` 를 사용하세요 (stdio 서버는 최초 `npx` 다운로드 때문에 느릴 수 있습니다).
 
 ---
 
 ## 5. 실행
 
 ```powershell
-# 환경 점검 (Unity, CLI, 규칙, MCP, 웹훅 상태 확인)
+# 환경 점검 (Unity, CLI, 규칙, 웹훅 + MCP 서버 실제 접속 확인)
 node dist/index.js doctor
 
 # 파이프라인 실행 (완료되지 않은 Step부터 이어서)
@@ -156,6 +177,8 @@ CLI 옵션:
 | `--no-commit` | 자동 커밋 비활성화 |
 | `--dry-run` | 프롬프트 조립만 확인 |
 | `--debug` | Agent 스트림 원문까지 출력 |
+| `--no-mcp-probe` | MCP 서버 실제 접속 점검 생략 (`doctor`, `run`) |
+| `--mcp-timeout <ms>` | MCP 응답 대기 시간 (기본 20000) |
 
 `Ctrl+C` 를 누르면 진행 중인 Step을 마친 뒤 안전하게 종료하며, 진행 상태는 `runtime/state.json` 에 남아 다음 실행에서 이어집니다.
 
@@ -175,7 +198,7 @@ npx tsx src/index.ts run --dry-run
 이전 대화 전체를 넘기는 대신 다음만 압축해서 최상단에 주입합니다.
 
 1. `.cursorrules` / `.cursor/rules` / `AGENTS.md` (System Context)
-2. 감지된 MCP 서버 목록과 자율 조작 지침
+2. 감지된 MCP 서버 목록(전역 + 프로젝트)과 자율 조작 지침
 3. `state.json` 의 현재 진행 상태 (완료 Step, 시도 횟수)
 4. 최근 5개 Step의 핵심 요약과 변경 파일 (`memoryManager` 가 Agent 출력에서 점수 기반으로 추출)
 5. 기획서 요약 (최대 6,000자)
@@ -215,7 +238,8 @@ cursorAutoWork/
 ├─ src/
 │  ├─ index.ts           # CLI 진입점 (run / init / status / doctor)
 │  ├─ orchestrator.ts    # 메인 제어 루프, 재시도, 상태 관리
-│  ├─ cursorRunner.ts    # cursor-agent spawn, NDJSON 파싱, .cursorrules/MCP 감지
+│  ├─ cursorRunner.ts    # cursor-agent spawn, NDJSON 파싱, .cursorrules 수집
+│  ├─ mcpProbe.ts        # mcp.json 병합 로딩, MCP 서버 라이브 핸드셰이크 점검
 │  ├─ unityValidator.ts  # Unity 배치모드 실행, CS 에러 파싱, NUnit XML 파싱
 │  ├─ gitManager.ts      # diff 수집, 컨벤션 정적 검사, 자동 커밋
 │  ├─ memoryManager.ts   # Fresh Context 프롬프트 조립, 요약 추출, state.json
