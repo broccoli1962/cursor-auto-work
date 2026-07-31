@@ -10,6 +10,7 @@ import {
 } from './memoryManager';
 import { Notifier } from './notifier';
 import { loadRoadmap } from './roadmap';
+import { applySubagentModel } from './subagents';
 import type {
   AgentRunResult,
   OrchestratorConfig,
@@ -67,6 +68,7 @@ export class Orchestrator {
     const startedAt = Date.now();
     this.gitAvailable = await ensureGitRepo(this.config);
     if (this.gitAvailable) ensureUnityGitignore(this.config);
+    applySubagentModel(this.config);
 
     const steps = this.selectSteps(options);
     if (steps.length === 0) {

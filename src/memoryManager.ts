@@ -171,14 +171,20 @@ export function buildStepPrompt(args: BuildPromptArgs): string {
   );
 
   if (mcpServers.length > 0) {
-    sections.push(
-      [
-        '# [TOOLING] 사용 가능한 MCP 서버',
-        `연결된 MCP: ${mcpServers.join(', ')}`,
-        'C# 스크립트 작성뿐 아니라 GameObject 생성/Component 부착/Addressables 그룹 설정 등 Unity Editor 조작이 필요하면 MCP 도구를 직접 호출해 처리할 것.',
-        '사람의 확인을 기다리지 말고 자율적으로 실행하라.',
-      ].join('\n'),
-    );
+    const tooling = [
+      '# [TOOLING] 사용 가능한 MCP 서버',
+      `연결된 MCP: ${mcpServers.join(', ')}`,
+      'C# 스크립트 작성뿐 아니라 GameObject 생성/Component 부착/Addressables 그룹 설정 등 Unity Editor 조작이 필요하면 MCP 도구를 직접 호출해 처리할 것.',
+      '사람의 확인을 기다리지 말고 자율적으로 실행하라.',
+    ];
+
+    if (config.cursorSubagentModel && config.cursorSubagentModel !== 'omit') {
+      tooling.push(
+        `Task 도구로 subagent 를 띄울 때 모델을 고를 수 있다면 ${config.cursorSubagentModel} 을 사용할 것.`,
+      );
+    }
+
+    sections.push(tooling.join('\n'));
   }
 
   sections.push(

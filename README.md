@@ -78,8 +78,10 @@ UNITY_PATH=C:\Program Files\Unity\Hub\Editor\2022.3.40f1\Editor\Unity.exe
 | `TARGET_PROJECT_PATH` | `process.cwd()` | 작업 대상 Unity 프로젝트 루트 |
 | `UNITY_PATH` | (없음) | Unity.exe 경로. 미설정 시 컴파일 검수를 건너뜀 |
 | `CURSOR_AGENT_BIN` | `cursor-agent` | CLI 실행 명령 |
-| `CURSOR_MODEL` | (CLI 기본값) | 사용할 모델 |
+| `CURSOR_MODEL` | (CLI 기본값) | 메인 Agent가 사용할 모델 |
+| `CURSOR_SUBAGENT_MODEL` | (변경 안 함) | Subagent가 사용할 모델. `.cursor/agents/*.md` 의 `model` 필드에 반영 ([4-4](#4-4-subagent-모델-지정)) |
 | `CURSOR_YOLO` | `true` | `--force` 를 붙여 MCP 도구 호출/파일 쓰기를 자동 승인 |
+| `CURSOR_PROMPT_DELIVERY` | `auto` | 프롬프트 전달 방식: `auto` / `argv` / `stdin` / `file` ([4-5](#4-5-프롬프트-전달-방식)) |
 | `DISCORD_WEBHOOK_URL` | (없음) | 미설정 시 알림은 콘솔에만 출력 |
 | `SPEC_PATH` / `ROADMAP_PATH` | `./docs/*` | **대상 프로젝트 기준** 상대경로 |
 | `STATE_PATH` | `./runtime/state.json` | 진행 상태 저장 위치 |
@@ -144,6 +146,51 @@ node dist/index.js doctor
 - UnityMCP는 서버가 떠 있어도 Unity Editor가 붙어 있지 않으면 도구 호출이 실패하므로, `mcpforunity://instances` 리소스를 추가로 읽어 **연결된 Editor 인스턴스**까지 표시합니다. 인스턴스가 없으면 경고가 뜹니다.
 - 응답하지 않는 서버는 `[FAIL]` 과 원인(`ECONNREFUSED`, 타임아웃, 프로세스 종료 stderr 등)이 함께 출력되고, `[WARN]` 이슈로 요약됩니다. 종료 코드는 기존 `FATAL` 이슈 기준을 유지합니다.
 - `run` 도 시작 직전 같은 점검을 수행해 로그에 남깁니다. 점검을 건너뛰려면 `--no-mcp-probe`, 대기 시간을 늘리려면 `--mcp-timeout <ms>` 를 사용하세요 (stdio 서버는 최초 `npx` 다운로드 때문에 느릴 수 있습니다).
+
+### 4-4. Subagent 모델 지정
+
+`cursor-agent` CLI에는 Subagent(Task 도구) 모델을 지정하는 플래그가 없습니다. 유일한 제어 지점은 대상 프로젝트의 `.cursor/agents/*.md` frontmatter에 있는 `model` 필드이므로, `CURSOR_SUBAGENT_MODEL` 값을 **파이프라인 시작 직전에 그 파일들에 반영**합니다.
+
+```dotenv
+CURSOR_SUBAGENT_MODEL=composer-2.5
+```
+
+```markdown
+---
+name: verifier
+description: 완료된 작업을 검증한다.
+model: composer-2.5   ← 이 줄이 자동으로 맞춰집니다
+---
+```
+
+| 값 | 동작 |
+| --- | --- |
+| (빈 값) | 기존 정의를 건드리지 않음 (기본값) |
+| 모델 ID | 해당 모델로 고정. `claude-opus-5[effort=high]` 처럼 파라미터도 사용 가능 |
+| `inherit` | 부모 Agent 모델을 따르도록 명시 |
+| `omit` | `model` 필드를 제거. CLI에서 부모 모델 상속이 가장 잘 동작하는 방식 |
+
+- frontmatter가 없는 파일은 건드리지 않고 경고만 남깁니다.
+- 내장 Subagent(`explore`, `bash`, `browser`)의 모델은 CLI에서 지정할 수 없습니다.
+- 현재 `doctor` 는 감지된 Subagent와 각자의 모델을 `이름[모델]` 형태로 출력합니다.
+
+### 4-5. 프롬프트 전달 방식
+
+Windows에서 `cursor-agent` 는 `.cmd` / `.ps1` 런처로 배포되어 셸(`cmd.exe`)을 경유해 실행됩니다. `cmd.exe` 명령행에는 두 가지 제약이 있습니다.
+
+- 전체 명령행이 **8191자**를 넘으면 `명령줄이 너무 깁니다.` 로 즉시 실패합니다.
+- 따옴표 안이라도 **줄바꿈은 명령 구분자**로 처리되어, 여러 줄 프롬프트는 첫 줄만 전달됩니다.
+
+기획서와 규칙이 주입된 Step 프롬프트는 보통 2만 자가 넘고 당연히 여러 줄이므로, 기본값 `auto` 는 이런 경우 프롬프트를 **stdin으로 전달**합니다.
+
+| 값 | 동작 |
+| --- | --- |
+| `auto` | 명령행에 안전하게 실릴 때만 인자로, 그 외에는 stdin으로 전달 (기본값) |
+| `argv` | 항상 명령행 인자로 전달 |
+| `stdin` | 항상 표준 입력으로 전달 |
+| `file` | 프롬프트를 `runtime/prompts/` 에 저장하고 그 경로를 읽으라고 지시 |
+
+`auto` 에서 stdin 전달이 실패하면 자동으로 `file` 방식으로 한 번 더 시도합니다. CLI 버전에 따라 stdin을 받지 못한다면 `CURSOR_PROMPT_DELIVERY=file` 로 고정하세요.
 
 ---
 
@@ -245,7 +292,9 @@ cursorAutoWork/
 │  ├─ memoryManager.ts   # Fresh Context 프롬프트 조립, 요약 추출, state.json
 │  ├─ notifier.ts        # Discord Webhook Embed 전송
 │  ├─ roadmap.ts         # roadmap.json 로딩 및 스키마 검증
+│  ├─ subagents.ts       # .cursor/agents frontmatter 의 subagent 모델 동기화
 │  ├─ config.ts          # 환경 변수 로딩 및 사전 점검
+│  ├─ encoding.ts        # 콘솔 코드페이지 처리 및 자식 프로세스 출력 디코딩
 │  ├─ logger.ts          # 콘솔 + 파일 로거
 │  └─ types.ts           # 공용 타입 정의
 ├─ docs/                 # 기획서/로드맵 작성 예시
@@ -266,12 +315,15 @@ cursorAutoWork/
 
 | 증상 | 원인 및 조치 |
 | --- | --- |
-| `cursor-agent 실행 실패: spawn ENOENT` | CLI가 PATH에 없음. `CURSOR_AGENT_BIN` 에 절대경로를 지정하세요. |
+| `cursor-agent 실행 실패: spawn ENOENT` / `'agent'은(는) 내부 또는 외부 명령... 아닙니다` | CLI가 PATH에 없습니다. 공식 실행 파일 이름은 `cursor-agent` 이며, `doctor` 가 `--version` 을 실제로 호출해 확인해 줍니다. 해결되지 않으면 `CURSOR_AGENT_BIN` 에 절대경로를 지정하세요. |
 | Unity가 즉시 종료하고 exit code가 0이 아님 | Unity Editor가 같은 프로젝트를 열어 둔 상태면 `Library` 락으로 배치모드가 실패합니다. 에디터를 닫고 실행하세요. 라이선스 미인증도 같은 증상입니다. |
 | 매번 "변경된 파일이 하나도 없습니다" 로 실패 | Agent가 파일을 쓰지 못하는 상태입니다. `CURSOR_YOLO=true` 인지, 대상 경로에 쓰기 권한이 있는지 확인하세요. |
 | 컴파일 검수가 계속 타임아웃 | 최초 임포트는 오래 걸립니다. Unity Editor로 프로젝트를 한 번 연 뒤 실행하거나 `UNITY_TIMEOUT_MS` 를 늘리세요. |
 | 한 Step에서 계속 재시도 후 중단 | Task 단위가 너무 큽니다. `roadmap.json` 의 Step을 더 잘게 나누세요. |
+| `cursor-agent 실행 오류: 명령줄이 너무 깁니다.` | Windows `cmd.exe` 의 8191자 명령행 상한입니다. `CURSOR_PROMPT_DELIVERY=auto`(기본값)면 stdin으로 자동 우회합니다. 그래도 실패하면 `file` 로 고정하세요 ([4-5](#4-5-프롬프트-전달-방식)). |
+| Agent가 Task 지시의 일부만 수행함 | 여러 줄 프롬프트가 명령행에서 잘렸을 수 있습니다. `CURSOR_PROMPT_DELIVERY` 를 `argv` 로 강제하지 마세요. |
 | 콘솔 한글이 깨짐 | 실행 시 자동으로 `chcp 65001` 을 적용하지만, 일부 터미널에서는 수동으로 UTF-8 코드페이지를 설정해야 합니다. 로그 파일(`runtime/orchestrator.log`)은 항상 UTF-8입니다. |
+| 로그의 오류 메시지가 `����` 로 나옴 | 자식 프로세스가 로컬 코드페이지(한국어 949 등)로 출력한 경우입니다. 현재는 UTF-8 → 콘솔 코드페이지 순으로 디코딩해 복원하므로, 재현되면 이슈로 알려주세요. |
 
 ---
 

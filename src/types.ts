@@ -4,6 +4,15 @@
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
+/**
+ * 프롬프트를 cursor-agent 에 전달하는 방식.
+ * - `argv`  : 명령행 인자로 전달 (Windows cmd.exe 는 8191자 상한)
+ * - `stdin` : 표준 입력으로 전달 (길이 제한 없음)
+ * - `file`  : 파일로 저장하고 그 경로를 읽으라고 지시
+ * - `auto`  : 명령행 상한을 넘지 않으면 argv, 넘으면 stdin (실패 시 file 폴백)
+ */
+export type PromptDelivery = 'auto' | 'argv' | 'stdin' | 'file';
+
 export interface OrchestratorConfig {
   /** Unity 프로젝트 루트 (Assets/, ProjectSettings/ 위치) */
   targetProjectPath: string;
@@ -13,8 +22,16 @@ export interface OrchestratorConfig {
   cursorAgentBin: string;
   /** 사용할 모델 (빈 값이면 CLI 기본값) */
   cursorModel: string;
+  /**
+   * Subagent(Task 도구)가 사용할 모델.
+   * CLI 에는 해당 옵션이 없어 `.cursor/agents/*.md` frontmatter 의 `model` 필드로 반영한다.
+   * 빈 값이면 기존 정의를 건드리지 않는다. `omit` 이면 model 필드를 제거해 부모 모델을 상속시킨다.
+   */
+  cursorSubagentModel: string;
   /** MCP/파일쓰기 자동 승인 여부 */
   cursorYolo: boolean;
+  /** 프롬프트 전달 방식 */
+  promptDelivery: PromptDelivery;
 
   discordWebhookUrl: string;
 

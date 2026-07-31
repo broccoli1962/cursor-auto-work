@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import dotenv from 'dotenv';
 
-import type { LogLevel, OrchestratorConfig } from './types';
+import type { LogLevel, OrchestratorConfig, PromptDelivery } from './types';
 
 dotenv.config();
 
@@ -44,12 +44,19 @@ export function loadConfig(overrides: Partial<OrchestratorConfig> = {}): Orchest
     ? logLevelRaw
     : 'info';
 
+  const deliveryRaw = str('CURSOR_PROMPT_DELIVERY', 'auto').toLowerCase() as PromptDelivery;
+  const promptDelivery: PromptDelivery = ['auto', 'argv', 'stdin', 'file'].includes(deliveryRaw)
+    ? deliveryRaw
+    : 'auto';
+
   const config: OrchestratorConfig = {
     targetProjectPath,
     unityPath: overrides.unityPath ?? str('UNITY_PATH'),
     cursorAgentBin: overrides.cursorAgentBin ?? str('CURSOR_AGENT_BIN', 'cursor-agent'),
     cursorModel: overrides.cursorModel ?? str('CURSOR_MODEL'),
+    cursorSubagentModel: overrides.cursorSubagentModel ?? str('CURSOR_SUBAGENT_MODEL'),
     cursorYolo: overrides.cursorYolo ?? bool('CURSOR_YOLO', true),
+    promptDelivery: overrides.promptDelivery ?? promptDelivery,
 
     discordWebhookUrl: overrides.discordWebhookUrl ?? str('DISCORD_WEBHOOK_URL'),
 

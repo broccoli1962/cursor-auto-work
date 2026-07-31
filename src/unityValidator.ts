@@ -4,6 +4,7 @@ import path from 'node:path';
 
 import { XMLParser } from 'fast-xml-parser';
 
+import { ConsoleTail } from './encoding';
 import { createLogger } from './logger';
 import type {
   CompileError,
@@ -78,7 +79,8 @@ function spawnUnity(
       windowsHide: true,
     });
 
-    let stderr = '';
+    const stderrTail = new ConsoleTail(20_000);
+    let spawnErrorMessage = '';
     let timedOut = false;
     let settled = false;
 
@@ -88,21 +90,21 @@ function spawnUnity(
       child.kill('SIGKILL');
     }, timeoutMs);
 
-    child.stderr?.setEncoding('utf8');
-    child.stderr?.on('data', (chunk: string) => {
-      stderr += chunk;
-      if (stderr.length > 20_000) stderr = stderr.slice(-20_000);
-    });
+    child.stderr?.on('data', (chunk: Buffer) => stderrTail.push(chunk));
 
     const settle = (exitCode: number | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ exitCode, timedOut, stderr: stderr.trim() });
+      resolve({
+        exitCode,
+        timedOut,
+        stderr: `${stderrTail.toString()}${spawnErrorMessage}`.trim(),
+      });
     };
 
     child.on('error', (error) => {
-      stderr += `\n[spawn error] ${error.message}`;
+      spawnErrorMessage += `\n[spawn error] ${error.message}`;
       settle(null);
     });
     child.on('close', (code) => settle(code));

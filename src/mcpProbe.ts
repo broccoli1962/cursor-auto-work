@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import axios from 'axios';
 
+import { decodeConsole } from './encoding';
 import { createLogger } from './logger';
 
 const log = createLogger('mcp');
@@ -356,19 +357,6 @@ class StdioRpcSession implements RpcSession {
         resolve();
       });
     });
-  }
-}
-
-/** Windows 콘솔은 UTF-8 이 아닌 로컬 코드페이지(한국어 949 등)로 stderr 를 출력한다. */
-function decodeConsole(buffer: Buffer): string {
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(buffer);
-  } catch {
-    try {
-      return new TextDecoder('euc-kr').decode(buffer);
-    } catch {
-      return buffer.toString('latin1');
-    }
   }
 }
 

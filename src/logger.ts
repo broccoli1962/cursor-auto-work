@@ -26,7 +26,7 @@ export function configureLogger(level: LogLevel, logFilePath?: string): void {
   currentLevel = level;
   if (logFilePath) {
     fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
-    fileStream = fs.createWriteStream(logFilePath, { flags: 'a' });
+    fileStream = fs.createWriteStream(logFilePath, { flags: 'a', encoding: 'utf8' });
   }
 }
 

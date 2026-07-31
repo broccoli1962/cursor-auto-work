@@ -1,17 +1,18 @@
 #!/usr/bin/env node
-import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
 import { ensureRuntimeDirs, loadConfig, validateConfig } from './config';
 import type { ValidationIssue } from './config';
-import { collectCursorRules } from './cursorRunner';
+import { collectCursorRules, probeCursorAgent } from './cursorRunner';
+import { enableUtf8Console } from './encoding';
 import { closeLogger, configureLogger, createLogger } from './logger';
 import { formatProbeResult, loadMcpServers, probeMcpServers } from './mcpProbe';
 import type { McpProbeResult } from './mcpProbe';
 import { loadState } from './memoryManager';
 import { Orchestrator } from './orchestrator';
 import { loadRoadmap } from './roadmap';
+import { listSubagents } from './subagents';
 import type { OrchestratorConfig } from './types';
 
 const log = createLogger('cli');
@@ -248,7 +249,16 @@ async function commandDoctor(
   const issues = validateConfig(config);
   const rules = collectCursorRules(config.targetProjectPath);
   const servers = loadMcpServers(config.targetProjectPath);
+  const subagents = listSubagents(config);
   const skipProbe = flags['no-mcp-probe'] === true;
+
+  const agentProbe = await probeCursorAgent(config);
+  if (!agentProbe.ok) {
+    issues.push({
+      fatal: true,
+      message: `cursor-agent 를 실행할 수 없습니다 (CURSOR_AGENT_BIN=${config.cursorAgentBin}): ${agentProbe.error}`,
+    });
+  }
 
   const lines = [
     '',
@@ -256,12 +266,20 @@ async function commandDoctor(
     `대상 프로젝트   : ${config.targetProjectPath}`,
     `Unity 실행 파일 : ${config.unityPath || '(미설정)'}`,
     `cursor-agent    : ${config.cursorAgentBin}${config.cursorYolo ? ' (--force 자동 승인)' : ''}`,
+    `  └ 실행 확인   : ${agentProbe.ok ? agentProbe.version : `실패 - ${agentProbe.error}`}`,
     `모델            : ${config.cursorModel || '(CLI 기본값)'}`,
+    `Subagent 모델   : ${config.cursorSubagentModel || '(변경 안 함)'}`,
+    `프롬프트 전달   : ${config.promptDelivery}`,
     `기획서          : ${config.specPath}`,
     `로드맵          : ${config.roadmapPath}`,
     `상태 파일       : ${config.statePath}`,
     `규칙 주입       : ${rules ? `${rules.length} chars` : '없음'}`,
     `MCP 등록        : ${servers.length > 0 ? servers.map((s) => `${s.name}(${s.scope})`).join(', ') : '없음'}`,
+    `Subagent 정의   : ${
+      subagents.length > 0
+        ? subagents.map((s) => `${s.name}[${s.model ?? 'inherit'}]`).join(', ')
+        : '없음 (.cursor/agents)'
+    }`,
     `Discord 알림    : ${config.discordWebhookUrl ? '활성' : '비활성'}`,
     `최대 재시도     : ${config.maxRetries}`,
     '',
@@ -333,16 +351,6 @@ async function commandRun(config: OrchestratorConfig, flags: ParsedArgs['flags']
   } finally {
     process.off('SIGINT', onSignal);
     process.off('SIGTERM', onSignal);
-  }
-}
-
-/** Windows 콘솔 기본 코드페이지(949 등)에서 한글 출력이 깨지는 것을 방지한다. */
-function enableUtf8Console(): void {
-  if (process.platform !== 'win32') return;
-  try {
-    execSync('chcp 65001', { stdio: 'ignore', windowsHide: true });
-  } catch {
-    // 콘솔이 아닌 환경(파이프/CI)에서는 무시
   }
 }
 
