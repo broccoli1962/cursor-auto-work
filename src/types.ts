@@ -5,7 +5,16 @@
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 /**
- * 프롬프트를 cursor-agent 에 전달하는 방식.
+ * 검수 파이프라인 프리셋.
+ * - `lint`    : Git Diff + 컨벤션 린트
+ * - `compile` : lint + Unity Batchmode 컴파일
+ * - `full`    : lint + 컴파일 + EditMode 테스트 (roadmap step.runTests=true 일 때)
+ * - `skip`    : 검수 생략 (diff 수집만, 실패 없음)
+ */
+export type ValidationMode = 'lint' | 'compile' | 'full' | 'skip';
+
+/**
+ * 프롬프트를 agent CLI 에 전달하는 방식.
  * - `argv`  : 명령행 인자로 전달 (Windows cmd.exe 는 8191자 상한)
  * - `stdin` : 표준 입력으로 전달 (길이 제한 없음)
  * - `file`  : 파일로 저장하고 그 경로를 읽으라고 지시
@@ -18,20 +27,16 @@ export interface OrchestratorConfig {
   targetProjectPath: string;
   /** Unity Editor 실행 파일 경로 */
   unityPath: string;
-  /** cursor-agent 실행 커맨드 */
+  /** agent CLI 실행 커맨드 (공식 Cursor CLI) */
   cursorAgentBin: string;
   /** 사용할 모델 (빈 값이면 CLI 기본값) */
   cursorModel: string;
-  /**
-   * Subagent(Task 도구)가 사용할 모델.
-   * CLI 에는 해당 옵션이 없어 `.cursor/agents/*.md` frontmatter 의 `model` 필드로 반영한다.
-   * 빈 값이면 기존 정의를 건드리지 않는다. `omit` 이면 model 필드를 제거해 부모 모델을 상속시킨다.
-   */
-  cursorSubagentModel: string;
   /** MCP/파일쓰기 자동 승인 여부 */
   cursorYolo: boolean;
   /** 프롬프트 전달 방식 */
   promptDelivery: PromptDelivery;
+  /** 검수 파이프라인 프리셋 */
+  validationMode: ValidationMode;
 
   discordWebhookUrl: string;
 
@@ -45,7 +50,6 @@ export interface OrchestratorConfig {
   maxRetries: number;
   agentTimeoutMs: number;
   unityTimeoutMs: number;
-  runUnityTests: boolean;
   autoCommit: boolean;
   gitAuthorName: string;
   gitAuthorEmail: string;
@@ -63,7 +67,7 @@ export interface RoadmapStep {
   acceptanceCriteria?: string[];
   /** 이 Step 에서 주로 다룰 파일/디렉터리 힌트 */
   targetFiles?: string[];
-  /** 이 Step 에서만 EditMode 테스트를 강제 실행 */
+  /** VALIDATION_MODE=full 일 때 이 Step 에서 EditMode 테스트 실행 */
   runTests?: boolean;
   /** 이 Step 전용 커밋 메시지 (미지정 시 기본 포맷) */
   commitMessage?: string;
@@ -75,7 +79,13 @@ export interface Roadmap {
   steps: RoadmapStep[];
 }
 
-export type StepStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'needs_human';
+export type StepStatus =
+  | 'pending'
+  | 'in_progress'
+  | 'completed'
+  | 'failed'
+  | 'needs_human'
+  | 'paused';
 
 /** 완료된 Step 의 압축 요약 (Fresh Context 주입용) */
 export interface StepMemory {
@@ -103,7 +113,7 @@ export interface OrchestratorState {
   updatedAt: string;
 }
 
-/** cursor-agent --output-format stream-json 이벤트의 느슨한 표현 */
+/** agent CLI --output-format stream-json 이벤트의 느슨한 표현 */
 export interface AgentStreamEvent {
   type?: string;
   subtype?: string;
@@ -173,6 +183,8 @@ export interface GitDiffResult {
 
 export interface ValidationReport {
   ok: boolean;
+  /** validationMode=skip 으로 실제 검수 없이 통과 처리된 결과인지 */
+  skipped: boolean;
   compile: UnityCompileResult;
   tests: UnityTestResult;
   diff: GitDiffResult;

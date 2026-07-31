@@ -10,6 +10,7 @@ import type {
   OrchestratorState,
   RoadmapStep,
   StepMemory,
+  ValidationMode,
   ValidationReport,
 } from './types';
 
@@ -137,6 +138,36 @@ function renderMemories(state: OrchestratorState): string {
     .join('\n');
 }
 
+function buildOutputContract(mode: ValidationMode): string {
+  const lines = [
+    '# [OUTPUT CONTRACT] 작업 규약',
+    '- 질문하지 말고 끝까지 자율적으로 완료할 것. 확인이 필요하면 가장 합리적인 선택을 하고 그 이유를 남길 것.',
+    '- 코드는 실제 파일에 저장할 것. 채팅에만 코드를 출력하는 것은 작업 미완료로 간주한다.',
+  ];
+
+  if (mode === 'compile' || mode === 'full') {
+    lines.push('- 오케스트레이터가 Unity Batchmode 로 컴파일 검수를 수행하므로 C# 컴파일 에러가 없어야 한다.');
+  }
+  if (mode === 'full') {
+    lines.push(
+      '- 이 Step 에 runTests 가 설정되어 있으면 EditMode 단위 테스트도 통과해야 한다.',
+    );
+  }
+  if (mode === 'lint') {
+    lines.push('- 검수는 Git Diff 린트(컨벤션 위반) 위주이지만, C# 코드는 컴파일 가능한 상태로 작성할 것.');
+  }
+
+  lines.push(
+    '- git commit 은 오케스트레이터가 수행하므로 직접 커밋하지 말 것.',
+    '- 작업을 마치면 마지막에 다음 형식으로 3줄 이내 요약을 남길 것:',
+    '  SUMMARY: <무엇을 구현했는지>',
+    '  FILES: <생성/수정한 주요 파일 경로들>',
+    '  NEXT: <다음 Step 에서 이어서 할 일>',
+  );
+
+  return lines.join('\n');
+}
+
 export interface BuildPromptArgs {
   config: OrchestratorConfig;
   state: OrchestratorState;
@@ -171,20 +202,14 @@ export function buildStepPrompt(args: BuildPromptArgs): string {
   );
 
   if (mcpServers.length > 0) {
-    const tooling = [
-      '# [TOOLING] 사용 가능한 MCP 서버',
-      `연결된 MCP: ${mcpServers.join(', ')}`,
-      'C# 스크립트 작성뿐 아니라 GameObject 생성/Component 부착/Addressables 그룹 설정 등 Unity Editor 조작이 필요하면 MCP 도구를 직접 호출해 처리할 것.',
-      '사람의 확인을 기다리지 말고 자율적으로 실행하라.',
-    ];
-
-    if (config.cursorSubagentModel && config.cursorSubagentModel !== 'omit') {
-      tooling.push(
-        `Task 도구로 subagent 를 띄울 때 모델을 고를 수 있다면 ${config.cursorSubagentModel} 을 사용할 것.`,
-      );
-    }
-
-    sections.push(tooling.join('\n'));
+    sections.push(
+      [
+        '# [TOOLING] 사용 가능한 MCP 서버',
+        `연결된 MCP: ${mcpServers.join(', ')}`,
+        'C# 스크립트 작성뿐 아니라 GameObject 생성/Component 부착/Addressables 그룹 설정 등 Unity Editor 조작이 필요하면 MCP 도구를 직접 호출해 처리할 것.',
+        '사람의 확인을 기다리지 말고 자율적으로 실행하라.',
+      ].join('\n'),
+    );
   }
 
   sections.push(
@@ -230,19 +255,7 @@ export function buildStepPrompt(args: BuildPromptArgs): string {
     );
   }
 
-  sections.push(
-    [
-      '# [OUTPUT CONTRACT] 작업 규약',
-      '- 질문하지 말고 끝까지 자율적으로 완료할 것. 확인이 필요하면 가장 합리적인 선택을 하고 그 이유를 남길 것.',
-      '- 코드는 실제 파일에 저장할 것. 채팅에만 코드를 출력하는 것은 작업 미완료로 간주한다.',
-      '- Unity 가 배치모드로 컴파일하므로 C# 컴파일 에러가 없어야 한다.',
-      '- git commit 은 오케스트레이터가 수행하므로 직접 커밋하지 말 것.',
-      '- 작업을 마치면 마지막에 다음 형식으로 3줄 이내 요약을 남길 것:',
-      '  SUMMARY: <무엇을 구현했는지>',
-      '  FILES: <생성/수정한 주요 파일 경로들>',
-      '  NEXT: <다음 Step 에서 이어서 할 일>',
-    ].join('\n'),
-  );
+  sections.push(buildOutputContract(config.validationMode));
 
   return sections.join('\n\n---\n\n');
 }

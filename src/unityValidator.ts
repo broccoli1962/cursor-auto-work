@@ -121,6 +121,26 @@ function readLogSafely(logPath: string): string {
   }
 }
 
+/** 실제로 Unity 를 띄우지 않고 통과 처리할 때 쓰는 컴파일 결과 */
+export function skippedCompileResult(
+  config: OrchestratorConfig,
+  reason: string,
+): UnityCompileResult {
+  return {
+    ok: true,
+    errors: [],
+    logPath: path.join(config.logsDir, 'unity_build.log'),
+    exitCode: null,
+    timedOut: false,
+    failureReason: reason,
+  };
+}
+
+/** 테스트를 실행하지 않았음을 나타내는 빈 결과 */
+export function skippedTestResult(): UnityTestResult {
+  return { ok: true, skipped: true, total: 0, passed: 0, failed: 0, failures: [] };
+}
+
 /**
  * Unity 를 배치모드로 기동해 C# 스크립트를 컴파일하고 unity_build.log 에서 에러를 파싱한다.
  * Unity 는 컴파일 에러가 있어도 exit code 0 을 반환하는 경우가 있어 로그 파싱을 1차 판정 근거로 삼는다.
@@ -131,14 +151,7 @@ export async function runUnityCompile(config: OrchestratorConfig): Promise<Unity
   if (fs.existsSync(logPath)) fs.rmSync(logPath, { force: true });
 
   if (!config.unityPath) {
-    return {
-      ok: true,
-      errors: [],
-      logPath,
-      exitCode: null,
-      timedOut: false,
-      failureReason: 'UNITY_PATH 미설정으로 컴파일 검수를 건너뛰었습니다.',
-    };
+    return skippedCompileResult(config, 'UNITY_PATH 미설정으로 컴파일 검수를 건너뛰었습니다.');
   }
 
   log.info('Unity Batchmode 컴파일 검수 시작...');
@@ -257,14 +270,7 @@ export async function runUnityTests(
   config: OrchestratorConfig,
   enabled: boolean,
 ): Promise<UnityTestResult> {
-  const empty: UnityTestResult = {
-    ok: true,
-    skipped: true,
-    total: 0,
-    passed: 0,
-    failed: 0,
-    failures: [],
-  };
+  const empty = skippedTestResult();
 
   if (!enabled || !config.unityPath) return empty;
 

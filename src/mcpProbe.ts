@@ -452,7 +452,11 @@ export async function probeMcpServers(
   timeoutMs = 20_000,
 ): Promise<McpProbeResult[]> {
   const entries = loadMcpServers(projectRoot);
-  return Promise.all(entries.map((entry) => probeMcpServer(entry, timeoutMs, projectRoot)));
+  const results: McpProbeResult[] = [];
+  for (const entry of entries) {
+    results.push(await probeMcpServer(entry, timeoutMs, projectRoot));
+  }
+  return results;
 }
 
 /** doctor 출력용 한 줄 요약. */

@@ -2,18 +2,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { ensureRuntimeDirs, loadConfig, validateConfig } from './config';
+import { describeValidationMode, ensureRuntimeDirs, loadConfig, validateConfig } from './config';
 import type { ValidationIssue } from './config';
 import { collectCursorRules, probeCursorAgent } from './cursorRunner';
 import { enableUtf8Console } from './encoding';
 import { closeLogger, configureLogger, createLogger } from './logger';
 import { formatProbeResult, loadMcpServers, probeMcpServers } from './mcpProbe';
 import type { McpProbeResult } from './mcpProbe';
-import { loadState } from './memoryManager';
-import { Orchestrator } from './orchestrator';
+import { buildStepPrompt, loadState } from './memoryManager';
+import { Orchestrator, selectPreviewSteps } from './orchestrator';
 import { loadRoadmap } from './roadmap';
-import { listSubagents } from './subagents';
-import type { OrchestratorConfig } from './types';
+import type { OrchestratorConfig, ValidationMode } from './types';
 
 const log = createLogger('cli');
 
@@ -49,6 +48,17 @@ function numberFlag(flags: ParsedArgs['flags'], key: string): number | undefined
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function parseValidationFlag(flags: ParsedArgs['flags']): ValidationMode | undefined {
+  const value = flags.validation;
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.toLowerCase();
+  if (normalized === 'lint' || normalized === 'compile' || normalized === 'full' || normalized === 'skip') {
+    return normalized;
+  }
+  log.warn(`알 수 없는 --validation '${value}' — 무시합니다.`);
+  return undefined;
+}
+
 function printHelp(): void {
   process.stdout.write(
     `
@@ -58,29 +68,35 @@ Unity & Cursor Headless CLI 오케스트레이터
   cursor-auto-work <command> [options]
 
 Commands:
-  run          roadmap.json 기준으로 파이프라인을 실행합니다 (기본값)
-  init         대상 프로젝트에 docs/spec.md, docs/roadmap.json 템플릿을 생성합니다
-  status       state.json 기반 진행 상황을 출력합니다
-  doctor       설정/환경을 점검하고 MCP 서버에 실제로 접속해 응답을 확인합니다
-  help         이 도움말을 출력합니다
+  run              roadmap.json 기준으로 파이프라인을 실행합니다 (기본값)
+  preview-prompt   Agent 를 실행하지 않고 Step 프롬프트만 출력합니다 (state 변경 없음)
+  init             대상 프로젝트에 docs/spec.md, docs/roadmap.json 템플릿을 생성합니다
+  status           state.json 기반 진행 상황을 출력합니다
+  doctor           설정/환경을 점검하고 MCP 서버에 실제로 접속해 응답을 확인합니다
+  help             이 도움말을 출력합니다
 
 Options:
-  --project <path>   TARGET_PROJECT_PATH 를 덮어씁니다
-  --from <n>         Step n 부터 실행 (완료 기록 무시)
-  --to <n>           Step n 까지만 실행
-  --retries <n>      MAX_RETRIES 덮어쓰기
-  --tests            EditMode 테스트 강제 실행
-  --no-commit        자동 커밋 비활성화
-  --dry-run          Agent 를 실행하지 않고 프롬프트 구성만 확인
-  --debug            로그 레벨을 debug 로 설정
-  --no-mcp-probe     MCP 서버 실제 접속 점검을 생략 (doctor, run)
-  --mcp-timeout <ms> MCP 응답 대기 시간 (기본 20000)
+  --project <path>       TARGET_PROJECT_PATH 를 덮어씁니다
+  --from <n>             Step n 부터 (preview: 완료 기록 무시)
+  --to <n>               Step n 까지만
+  --retries <n>          MAX_RETRIES 덮어쓰기
+  --validation <mode>    lint | compile | full | skip (VALIDATION_MODE 덮어쓰기)
+  --no-commit            자동 커밋 비활성화
+  --debug                로그 레벨을 debug 로 설정
+  --no-mcp-probe         MCP 서버 실제 접속 점검을 생략 (doctor, run)
+  --mcp-timeout <ms>     MCP 응답 대기 시간 (기본 20000)
+
+검수 모드 (VALIDATION_MODE):
+  lint     Git Diff + 컨벤션 린트 (기본값)
+  compile  lint + Unity Batchmode 컴파일
+  full     lint + 컴파일 + EditMode 테스트 (roadmap step.runTests=true 일 때)
+  skip     검수 생략 (diff 수집만)
 
 예시:
   cursor-auto-work run --project D:\\UnityProjects\\MyGame
-  cursor-auto-work run --from 3 --tests
+  cursor-auto-work run --validation full
+  cursor-auto-work preview-prompt --to 1
   cursor-auto-work doctor
-  cursor-auto-work doctor --mcp-timeout 40000
 `.trimStart(),
   );
 }
@@ -91,7 +107,8 @@ function buildConfig(flags: ParsedArgs['flags']): OrchestratorConfig {
   if (typeof flags.project === 'string') overrides.targetProjectPath = flags.project;
   const retries = numberFlag(flags, 'retries');
   if (retries !== undefined) overrides.maxRetries = retries;
-  if (flags.tests === true) overrides.runUnityTests = true;
+  const validationMode = parseValidationFlag(flags);
+  if (validationMode !== undefined) overrides.validationMode = validationMode;
   if (flags['no-commit'] === true) overrides.autoCommit = false;
   if (flags.debug === true) overrides.logLevel = 'debug';
 
@@ -200,8 +217,9 @@ function commandStatus(config: OrchestratorConfig): void {
   for (const step of roadmap.steps) {
     const done = state.completedSteps.includes(step.id);
     const current = state.currentStepId === step.id && !done;
+    const paused = state.status === 'paused' && state.currentStepId === step.id;
     const attempts = state.attempts[String(step.id)];
-    const mark = done ? '[x]' : current ? '[>]' : '[ ]';
+    const mark = done ? '[x]' : paused ? '[~]' : current ? '[>]' : '[ ]';
     const suffix = attempts ? ` (시도 ${attempts}회)` : '';
     lines.push(`  ${mark} Step ${step.id}: ${step.title}${suffix}`);
   }
@@ -214,7 +232,34 @@ function commandStatus(config: OrchestratorConfig): void {
   process.stdout.write(lines.join('\n'));
 }
 
-/** 프로브 결과를 doctor 이슈 목록으로 환산한다. 연결 실패는 치명적이지 않지만 반드시 눈에 띄어야 한다. */
+function commandPreviewPrompt(config: OrchestratorConfig, flags: ParsedArgs['flags']): void {
+  const roadmap = loadRoadmap(config.roadmapPath);
+  const state = loadState(config, roadmap.project);
+  const steps = selectPreviewSteps(
+    roadmap,
+    state,
+    numberFlag(flags, 'from'),
+    numberFlag(flags, 'to'),
+  );
+
+  if (steps.length === 0) {
+    log.info('출력할 Step 이 없습니다.');
+    return;
+  }
+
+  for (const step of steps) {
+    const prompt = buildStepPrompt({
+      config,
+      state,
+      step,
+      totalSteps: roadmap.steps.length,
+      attempt: 1,
+    });
+    process.stdout.write(`\n=== [preview] Step ${step.id}: ${step.title} (${prompt.length} chars) ===\n`);
+    process.stdout.write(`${prompt}\n`);
+  }
+}
+
 function mcpIssues(results: McpProbeResult[]): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
@@ -249,14 +294,13 @@ async function commandDoctor(
   const issues = validateConfig(config);
   const rules = collectCursorRules(config.targetProjectPath);
   const servers = loadMcpServers(config.targetProjectPath);
-  const subagents = listSubagents(config);
   const skipProbe = flags['no-mcp-probe'] === true;
 
   const agentProbe = await probeCursorAgent(config);
   if (!agentProbe.ok) {
     issues.push({
       fatal: true,
-      message: `cursor-agent 를 실행할 수 없습니다 (CURSOR_AGENT_BIN=${config.cursorAgentBin}): ${agentProbe.error}`,
+      message: `agent CLI 를 실행할 수 없습니다 (CURSOR_AGENT_BIN=${config.cursorAgentBin}): ${agentProbe.error}`,
     });
   }
 
@@ -265,21 +309,17 @@ async function commandDoctor(
     '=== 환경 점검 ===',
     `대상 프로젝트   : ${config.targetProjectPath}`,
     `Unity 실행 파일 : ${config.unityPath || '(미설정)'}`,
-    `cursor-agent    : ${config.cursorAgentBin}${config.cursorYolo ? ' (--force 자동 승인)' : ''}`,
+    `agent (CLI)     : ${config.cursorAgentBin}${config.cursorYolo ? ' (--force 자동 승인)' : ''}`,
     `  └ 실행 확인   : ${agentProbe.ok ? agentProbe.version : `실패 - ${agentProbe.error}`}`,
     `모델            : ${config.cursorModel || '(CLI 기본값)'}`,
-    `Subagent 모델   : ${config.cursorSubagentModel || '(변경 안 함)'}`,
     `프롬프트 전달   : ${config.promptDelivery}`,
+    `검수 모드       : ${config.validationMode} (${describeValidationMode(config)})`,
+    `자동 커밋       : ${config.autoCommit ? '활성' : '비활성'}`,
     `기획서          : ${config.specPath}`,
     `로드맵          : ${config.roadmapPath}`,
     `상태 파일       : ${config.statePath}`,
     `규칙 주입       : ${rules ? `${rules.length} chars` : '없음'}`,
     `MCP 등록        : ${servers.length > 0 ? servers.map((s) => `${s.name}(${s.scope})`).join(', ') : '없음'}`,
-    `Subagent 정의   : ${
-      subagents.length > 0
-        ? subagents.map((s) => `${s.name}[${s.model ?? 'inherit'}]`).join(', ')
-        : '없음 (.cursor/agents)'
-    }`,
     `Discord 알림    : ${config.discordWebhookUrl ? '활성' : '비활성'}`,
     `최대 재시도     : ${config.maxRetries}`,
     '',
@@ -345,7 +385,6 @@ async function commandRun(config: OrchestratorConfig, flags: ParsedArgs['flags']
     await orchestrator.run({
       fromStep: numberFlag(flags, 'from'),
       toStep: numberFlag(flags, 'to'),
-      dryRun: flags['dry-run'] === true,
     });
     return 0;
   } finally {
@@ -373,6 +412,9 @@ async function main(): Promise<void> {
       break;
     case 'status':
       commandStatus(config);
+      break;
+    case 'preview-prompt':
+      commandPreviewPrompt(config, flags);
       break;
     case 'doctor':
       process.exitCode = await commandDoctor(config, flags);

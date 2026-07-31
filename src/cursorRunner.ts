@@ -73,7 +73,7 @@ const POSIX_ARG_LIMIT = 128 * 1024;
 const LIMIT_MARGIN = 1_024;
 
 function useShell(): boolean {
-  // Windows 에서 cursor-agent 는 .cmd / .ps1 런처로 배포되어 shell 경유가 필요하다.
+  // Windows 에서 agent 는 .cmd / .ps1 런처로 배포되어 shell 경유가 필요하다.
   return process.platform === 'win32';
 }
 
@@ -354,7 +354,7 @@ function extractToolName(event: AgentStreamEvent): string | null {
 }
 
 /**
- * 단일 전달 방식으로 cursor-agent 를 한 번 실행한다.
+ * 단일 전달 방식으로 agent 를 한 번 실행한다.
  * NDJSON 스트림을 소비하고, 프로세스가 idle/exit 될 때까지 대기한다.
  */
 function runOnce(options: RunAgentOptions, plan: SpawnPlan): Promise<AgentRunResult> {
@@ -363,7 +363,7 @@ function runOnce(options: RunAgentOptions, plan: SpawnPlan): Promise<AgentRunRes
   const startedAt = Date.now();
 
   log.info(
-    `cursor-agent 실행 (${options.resumeSessionId ? `resume:${options.resumeSessionId}` : 'fresh context'}, prompt=${plan.delivery}) - prompt ${options.prompt.length} chars`,
+    `agent 실행 (${options.resumeSessionId ? `resume:${options.resumeSessionId}` : 'fresh context'}, prompt=${plan.delivery}) - prompt ${options.prompt.length} chars`,
   );
   log.debug(`args: ${args.map((a) => (a.length > 60 ? `${a.slice(0, 60)}…` : a)).join(' ')}`);
 
@@ -471,14 +471,14 @@ function runOnce(options: RunAgentOptions, plan: SpawnPlan): Promise<AgentRunRes
         durationMs: Date.now() - startedAt,
       };
       log.info(
-        `cursor-agent 종료 (code=${exitCode}, ${Math.round(result.durationMs / 1000)}s, tools=${toolCalls.length})`,
+        `agent 종료 (code=${exitCode}, ${Math.round(result.durationMs / 1000)}s, tools=${toolCalls.length})`,
       );
       resolve(result);
     };
 
     child.on('error', (error) => {
       spawnErrorMessage += `\n[spawn error] ${error.message}`;
-      log.error(`cursor-agent 실행 실패: ${error.message}`);
+      log.error(`agent 실행 실패: ${error.message}`);
       settle(null);
     });
 
@@ -494,7 +494,7 @@ function looksLikeCommandLineOverflow(stderr: string): boolean {
 }
 
 /**
- * cursor-agent 를 실행한다.
+ * agent 를 실행한다.
  * `auto` 모드에서 stdin 전달이 즉시 실패하면 파일 전달로 한 번 더 시도한다.
  */
 export async function runCursorAgent(options: RunAgentOptions): Promise<AgentRunResult> {
@@ -506,7 +506,7 @@ export async function runCursorAgent(options: RunAgentOptions): Promise<AgentRun
 
   if (looksLikeCommandLineOverflow(result.stderr)) {
     log.error(
-      '명령행 길이 제한으로 cursor-agent 가 프롬프트를 받지 못했습니다. CURSOR_PROMPT_DELIVERY=file 로 강제할 수 있습니다.',
+      '명령행 길이 제한으로 agent 가 프롬프트를 받지 못했습니다. CURSOR_PROMPT_DELIVERY=file 로 강제할 수 있습니다.',
     );
   }
 

@@ -5,29 +5,29 @@
 > **이 프로젝트는 실험용 테스트 버전입니다. 프로덕션 환경에서 사용하지 마세요.**
 >
 > - 실제 운영 중인 프로젝트나 백업이 없는 코드베이스를 대상으로 실행하지 마세요.
-> - 기본 설정(`CURSOR_YOLO=true`)에서 Agent가 **사람 확인 없이 파일을 수정하고 자동 커밋**합니다.
+> - 기본값은 `CURSOR_YOLO=false`, `AUTO_COMMIT=false`, `VALIDATION_MODE=lint` 입니다. UnityMCP 자율 조작·자동 커밋을 쓰려면 `.env` 에서 **명시적으로** 켜야 합니다.
 > - 검수 파이프라인(컴파일/테스트/Diff)은 아직 충분히 검증되지 않았고, 잘못된 변경을 통과시킬 수 있습니다.
 > - CLI 옵션, 환경 변수, `roadmap.json` 스키마는 예고 없이 변경될 수 있습니다.
 > - 반드시 **Git으로 관리되는 사본**에서, 별도 브랜치를 만들고 실행하세요.
 >
 > 사용에 따른 코드 손실이나 예기치 않은 변경에 대한 책임은 사용자에게 있습니다.
 
-Unity 프로젝트를 대상으로 **Cursor Headless CLI(`cursor-agent`)를 무인 제어**하는 Node.js(TypeScript) 오케스트레이터입니다.
+Unity 프로젝트를 대상으로 **Cursor CLI(`agent`)를 무인 제어**하는 Node.js(TypeScript) 오케스트레이터입니다.
 
 기획서(`spec.md`)와 단계별 로드맵(`roadmap.json`)을 읽어 Step 1부터 순차적으로 Agent에게 작업을 지시하고,
-Unity Batchmode 컴파일 · EditMode 테스트 · Git Diff 3단계 검수를 통과한 Step만 자동 커밋한 뒤 다음 Step으로 진행합니다.
-실패하면 컴파일 에러를 그대로 피드백 프롬프트로 만들어 재지시하고, 재시도 한도를 넘기면 Discord로 사람 개입을 요청합니다.
+`VALIDATION_MODE`에 따라 Git Diff 린트 · (선택) Unity 컴파일 · (선택) EditMode 테스트 검수를 통과한 Step만 자동 커밋한 뒤 다음 Step으로 진행합니다.
+실패하면 검수 결과를 피드백 프롬프트로 만들어 재지시하고, 재시도 한도를 넘기면 Discord로 사람 개입을 요청합니다.
 
 ```
 ┌─────────────┐   프롬프트    ┌──────────────┐   파일/에디터 조작   ┌──────────────┐
-│ Orchestrator│ ───────────▶ │ cursor-agent │ ──────────────────▶ │ Unity Project│
+│ Orchestrator│ ───────────▶ │    agent     │ ──────────────────▶ │ Unity Project│
 │  (이 저장소) │ ◀─────────── │ (+ UnityMCP) │                     └──────┬───────┘
 └──────┬──────┘  NDJSON 스트림 └──────────────┘                            │
        │                                                                   ▼
-       │  ① Unity -batchmode 컴파일  ② EditMode 테스트  ③ git diff 검수  ◀─┘
+       │  ① Git Diff 린트  ② (compile/full) Unity 컴파일  ③ (full+runTests) 테스트  ◀─┘
        │
        ├─ 통과 → git commit → 다음 Step (Fresh Context 재시작)
-       └─ 실패 → 에러 로그를 피드백 프롬프트로 재지시 (최대 N회) → 초과 시 Discord 🚨
+       └─ 실패 → 검수 결과를 피드백 프롬프트로 재지시 (최대 N회) → 초과 시 Discord 🚨
 ```
 
 ---
@@ -37,12 +37,12 @@ Unity Batchmode 컴파일 · EditMode 테스트 · Git Diff 3단계 검수를 �
 | 항목 | 버전/비고 |
 | --- | --- |
 | Node.js | 18 이상 (권장 20 LTS) |
-| Git | 자동 커밋 기능 사용 시 필수 |
+| Git | `lint`/`compile`/`full` 검수 및 자동 커밋 시 필수 |
 | Unity Editor | 컴파일/테스트 검수 대상 버전 (예: 2022.3 LTS) |
-| `cursor-agent` | Cursor Headless CLI. `cursor-agent --version` 으로 확인 |
+| `agent` | [Cursor CLI](https://cursor.com/docs/cli/overview). `agent --version` 으로 확인 |
 
-> `cursor-agent` 는 별도 설치가 필요합니다. 설치 후 `cursor-agent login` 으로 인증을 완료해 두어야
-> 오케스트레이터가 비대화형으로 Agent를 구동할 수 있습니다.
+> `agent` CLI 는 별도 설치가 필요합니다 ([Installation](https://cursor.com/docs/cli/installation)). Windows 예: `irm 'https://cursor.com/install?win32=true' | iex`  
+> 비대화형 실행을 위해 [Authentication](https://cursor.com/docs/cli/reference/authentication) (`CURSOR_API_KEY` 또는 로그인)을 완료해 두어야 오케스트레이터가 Agent를 구동할 수 있습니다.
 
 ---
 
@@ -64,10 +64,11 @@ npm run build
 Copy-Item .env.example .env
 ```
 
-최소한 다음 두 값은 반드시 지정해야 합니다.
+최소한 `TARGET_PROJECT_PATH` 는 반드시 지정해야 합니다. `UNITY_PATH` 는 `VALIDATION_MODE=compile` 또는 `full` 일 때 필요합니다.
 
 ```dotenv
 TARGET_PROJECT_PATH=D:\UnityProjects\MyGame
+# compile/full 모드일 때만 필수
 UNITY_PATH=C:\Program Files\Unity\Hub\Editor\2022.3.40f1\Editor\Unity.exe
 ```
 
@@ -76,20 +77,21 @@ UNITY_PATH=C:\Program Files\Unity\Hub\Editor\2022.3.40f1\Editor\Unity.exe
 | 변수 | 기본값 | 설명 |
 | --- | --- | --- |
 | `TARGET_PROJECT_PATH` | `process.cwd()` | 작업 대상 Unity 프로젝트 루트 |
-| `UNITY_PATH` | (없음) | Unity.exe 경로. 미설정 시 컴파일 검수를 건너뜀 |
-| `CURSOR_AGENT_BIN` | `cursor-agent` | CLI 실행 명령 |
+| `UNITY_PATH` | (없음) | Unity.exe. `compile`/`full` 모드에서 필수, `lint`/`skip` 에서는 검수에 미사용 |
+| `CURSOR_AGENT_BIN` | `agent` | Cursor CLI 실행 명령 |
 | `CURSOR_MODEL` | (CLI 기본값) | 메인 Agent가 사용할 모델 |
-| `CURSOR_SUBAGENT_MODEL` | (변경 안 함) | Subagent가 사용할 모델. `.cursor/agents/*.md` 의 `model` 필드에 반영 ([4-4](#4-4-subagent-모델-지정)) |
-| `CURSOR_YOLO` | `true` | `--force` 를 붙여 MCP 도구 호출/파일 쓰기를 자동 승인 |
-| `CURSOR_PROMPT_DELIVERY` | `auto` | 프롬프트 전달 방식: `auto` / `argv` / `stdin` / `file` ([4-5](#4-5-프롬프트-전달-방식)) |
+| `CURSOR_YOLO` | `false` | `--force` 를 붙여 MCP 도구 호출/파일 쓰기를 자동 승인 |
+| `CURSOR_PROMPT_DELIVERY` | `auto` | 프롬프트 전달 방식: `auto` / `argv` / `stdin` / `file` ([4-4](#4-4-프롬프트-전달-방식)) |
 | `DISCORD_WEBHOOK_URL` | (없음) | 미설정 시 알림은 콘솔에만 출력 |
 | `SPEC_PATH` / `ROADMAP_PATH` | `./docs/*` | **대상 프로젝트 기준** 상대경로 |
 | `STATE_PATH` | `./runtime/state.json` | 진행 상태 저장 위치 |
 | `MAX_RETRIES` | `3` | Step 당 최대 재시도 |
 | `AGENT_TIMEOUT_MS` | `1800000` | Agent 1회 실행 타임아웃 (30분) |
 | `UNITY_TIMEOUT_MS` | `1200000` | Unity 배치모드 타임아웃 (20분) |
-| `RUN_UNITY_TESTS` | `false` | EditMode 테스트 전역 기본값 |
-| `AUTO_COMMIT` | `true` | 검수 통과 시 자동 커밋 |
+| `VALIDATION_MODE` | `lint` | 검수 프리셋: `lint` / `compile` / `full` / `skip` ([6-2](#6-2-검수-파이프라인)) |
+| `AUTO_COMMIT` | `false` | 검수 통과 시 자동 커밋 |
+| `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` | (없음) | 자동 커밋 작성자 (미설정 시 로컬 git config) |
+| `MAX_ERROR_LINES` | `30` | 컴파일 실패 피드백에 포함할 에러 최대 줄 수 |
 | `LOG_LEVEL` | `info` | `debug` 로 하면 Agent 스트림 원문까지 출력 |
 
 ---
@@ -119,7 +121,7 @@ node dist/index.js init --project D:\UnityProjects\MyGame
 }
 ```
 
-`task` 만 필수이고 나머지는 선택입니다. `runTests` 는 해당 Step에서만 EditMode 테스트를 강제 실행합니다.
+`task` 만 필수이고 나머지는 선택입니다. `runTests: true` 는 **`VALIDATION_MODE=full` 일 때만** 해당 Step에서 EditMode 테스트를 실행합니다.
 
 ### 4-2. `.cursorrules` 와 UnityMCP
 
@@ -147,36 +149,9 @@ node dist/index.js doctor
 - 응답하지 않는 서버는 `[FAIL]` 과 원인(`ECONNREFUSED`, 타임아웃, 프로세스 종료 stderr 등)이 함께 출력되고, `[WARN]` 이슈로 요약됩니다. 종료 코드는 기존 `FATAL` 이슈 기준을 유지합니다.
 - `run` 도 시작 직전 같은 점검을 수행해 로그에 남깁니다. 점검을 건너뛰려면 `--no-mcp-probe`, 대기 시간을 늘리려면 `--mcp-timeout <ms>` 를 사용하세요 (stdio 서버는 최초 `npx` 다운로드 때문에 느릴 수 있습니다).
 
-### 4-4. Subagent 모델 지정
+### 4-4. 프롬프트 전달 방식
 
-`cursor-agent` CLI에는 Subagent(Task 도구) 모델을 지정하는 플래그가 없습니다. 유일한 제어 지점은 대상 프로젝트의 `.cursor/agents/*.md` frontmatter에 있는 `model` 필드이므로, `CURSOR_SUBAGENT_MODEL` 값을 **파이프라인 시작 직전에 그 파일들에 반영**합니다.
-
-```dotenv
-CURSOR_SUBAGENT_MODEL=composer-2.5
-```
-
-```markdown
----
-name: verifier
-description: 완료된 작업을 검증한다.
-model: composer-2.5   ← 이 줄이 자동으로 맞춰집니다
----
-```
-
-| 값 | 동작 |
-| --- | --- |
-| (빈 값) | 기존 정의를 건드리지 않음 (기본값) |
-| 모델 ID | 해당 모델로 고정. `claude-opus-5[effort=high]` 처럼 파라미터도 사용 가능 |
-| `inherit` | 부모 Agent 모델을 따르도록 명시 |
-| `omit` | `model` 필드를 제거. CLI에서 부모 모델 상속이 가장 잘 동작하는 방식 |
-
-- frontmatter가 없는 파일은 건드리지 않고 경고만 남깁니다.
-- 내장 Subagent(`explore`, `bash`, `browser`)의 모델은 CLI에서 지정할 수 없습니다.
-- 현재 `doctor` 는 감지된 Subagent와 각자의 모델을 `이름[모델]` 형태로 출력합니다.
-
-### 4-5. 프롬프트 전달 방식
-
-Windows에서 `cursor-agent` 는 `.cmd` / `.ps1` 런처로 배포되어 셸(`cmd.exe`)을 경유해 실행됩니다. `cmd.exe` 명령행에는 두 가지 제약이 있습니다.
+Windows에서 `agent` CLI 는 `.cmd` / `.ps1` 런처로 배포되어 셸(`cmd.exe`)을 경유해 실행됩니다. `cmd.exe` 명령행에는 두 가지 제약이 있습니다.
 
 - 전체 명령행이 **8191자**를 넘으면 `명령줄이 너무 깁니다.` 로 즉시 실패합니다.
 - 따옴표 안이라도 **줄바꿈은 명령 구분자**로 처리되어, 여러 줄 프롬프트는 첫 줄만 전달됩니다.
@@ -203,13 +178,13 @@ node dist/index.js doctor
 # 파이프라인 실행 (완료되지 않은 Step부터 이어서)
 node dist/index.js run
 
-# Step 3부터 5까지만 실행
+# Step 3부터 5까지만 실행 (전체 완료로 표시되지 않음 — 아래 6-5 참고)
 node dist/index.js run --from 3 --to 5
 
-# Agent를 실행하지 않고 조립된 프롬프트만 확인
-node dist/index.js run --dry-run --to 1
+# Agent를 실행하지 않고 조립된 프롬프트만 확인 (state.json 변경 없음)
+node dist/index.js preview-prompt --to 1
 
-# 진행 상황 확인
+# 진행 상황 확인 ([x] 완료 / [>] 진행 중 / [~] 일시 중지 / [ ] 대기)
 node dist/index.js status
 ```
 
@@ -220,19 +195,18 @@ CLI 옵션:
 | `--project <path>` | `TARGET_PROJECT_PATH` 덮어쓰기 |
 | `--from <n>` / `--to <n>` | 실행 범위 지정 |
 | `--retries <n>` | 재시도 한도 덮어쓰기 |
-| `--tests` | EditMode 테스트 강제 실행 |
+| `--validation <mode>` | `lint` / `compile` / `full` / `skip` (`VALIDATION_MODE` 덮어쓰기) |
 | `--no-commit` | 자동 커밋 비활성화 |
-| `--dry-run` | 프롬프트 조립만 확인 |
 | `--debug` | Agent 스트림 원문까지 출력 |
 | `--no-mcp-probe` | MCP 서버 실제 접속 점검 생략 (`doctor`, `run`) |
 | `--mcp-timeout <ms>` | MCP 응답 대기 시간 (기본 20000) |
 
-`Ctrl+C` 를 누르면 진행 중인 Step을 마친 뒤 안전하게 종료하며, 진행 상태는 `runtime/state.json` 에 남아 다음 실행에서 이어집니다.
+`Ctrl+C` 를 누르면 진행 중인 Step(현재 시도)을 마친 뒤 안전하게 종료하며, 진행 상태는 `runtime/state.json` 에 `status: "paused"` 로 남아 다음 실행에서 이어집니다.
 
 개발 중에는 빌드 없이 실행할 수도 있습니다.
 
 ```powershell
-npx tsx src/index.ts run --dry-run
+npx tsx src/index.ts preview-prompt --to 1
 ```
 
 ---
@@ -250,21 +224,54 @@ npx tsx src/index.ts run --dry-run
 4. 최근 5개 Step의 핵심 요약과 변경 파일 (`memoryManager` 가 Agent 출력에서 점수 기반으로 추출)
 5. 기획서 요약 (최대 6,000자)
 6. 현재 Task와 완료 조건
-7. 재시도인 경우 직전 검수 실패 피드백
+7. 재시도인 경우 직전 **검수 실패·Agent 실행 실패·커밋 실패** 피드백
 
-### 6-2. 검수 파이프라인
+Agent CLI 가 비정상 종료(exit ≠ 0, 타임아웃)한 경우에도 출력 요약을 메모리에 남겨, 다음 시도 프롬프트에 반영합니다.
+
+### 6-2. 검수 파이프라인 (`VALIDATION_MODE`)
+
+검수는 **Git index 를 수정하지 않고** 워킹 트리 diff + untracked 파일 직접 읽기로 수행합니다.
+
+| 모드 | 실행 내용 | Unity 기동 |
+| --- | --- | --- |
+| `lint` (기본) | Git Diff + 컨벤션 린트 | 0회 |
+| `compile` | lint + Batchmode 컴파일 | 1회 |
+| `full` | lint + 컴파일 + EditMode 테스트 (`step.runTests=true` 일 때) | 1~2회 |
+| `skip` | diff 수집만, 실패 없음 | 0회 |
+
+모드별 실패 조건 (`skip` 제외):
 
 | 단계 | 내용 | 실패 시 |
 | --- | --- | --- |
-| ① 컴파일 | `Unity.exe -batchmode -quit -nographics -projectPath . -logFile Logs/unity_build.log` 실행 후 로그에서 `error CS####` 파싱 | 에러 상위 N개(`MAX_ERROR_LINES`)를 피드백 프롬프트로 구성 |
-| ② 테스트 | `-runTests -testPlatform EditMode -testResults Logs/unity_test_results.xml` 후 NUnit XML 파싱 | 실패한 테스트명과 메시지를 피드백에 포함 |
-| ③ Git Diff | 변경 파일 수집 + `Debug.Log` / `console.log` / `TODO` / 충돌 마커 정적 검사 | 변경사항이 없거나 컨벤션 위반 시 실패 처리 |
+| Git Diff 린트 | tracked `git diff HEAD` + untracked 텍스트 파일 본문 검사. `Debug.Log` / `TODO` / 충돌 마커 등. `.png`·`.fbx` 등 바이너리·에셋은 생략 | **변경 없음** 또는 컨벤션 위반 |
+| Unity 컴파일 | `compile`/`full` — `-batchmode -quit` 후 `error CS####` 파싱 | 에러 상위 N개를 피드백에 포함 |
+| EditMode 테스트 | `full` + `runTests: true` — NUnit XML 파싱 | 실패 테스트명·메시지를 피드백에 포함 |
 
-Unity는 컴파일 에러가 있어도 종료 코드 0을 반환하는 경우가 있어, **로그 파싱 결과를 1차 판정 근거**로 사용합니다.
+`lint`/`compile`/`full` 은 **Git 저장소가 필수**입니다. Unity는 컴파일 에러가 있어도 exit code 0을 반환하는 경우가 있어 **로그 파싱을 1차 판정**으로 사용합니다.
 
-세 단계를 모두 통과하면 `git add . && git commit -m "feat: complete Step N - <title>"` 을 수행하고 다음 Step으로 넘어갑니다.
+검수를 모두 통과하면 자동 커밋(`AUTO_COMMIT=true`) 시 **해당 Step 에서 diff 로 수집된 변경 파일만** `git add` 한 뒤 커밋합니다. 워킹 트리에 있던 기존 미커밋 변경은 함께 올라가지 않습니다.
 
-### 6-3. Discord 알림
+`AUTO_COMMIT=true` 인데 커밋이 실패하면 Step 을 완료 처리하지 않고, 검수 실패와 동일하게 피드백을 주입해 재시도합니다.
+
+### 6-3. 검수 건너뛰기
+
+```dotenv
+VALIDATION_MODE=skip
+```
+
+```powershell
+node dist/index.js run --validation skip
+```
+
+켜져 있으면 lint/컴파일/테스트를 생략하고 Agent 실행 직후 Step을 통과 처리합니다.
+
+- 커밋 메시지용 변경 파일 **수집**은 유지하지만, 변경 없음·린트 위반으로 실패시키지 않습니다.
+- Agent 프로세스 자체가 실패한 경우에만 재시도합니다.
+- `AUTO_COMMIT=true` 이면 검증되지 않은 코드가 커밋될 수 있으며, 커밋 본문에 `NOTE: validation skipped (VALIDATION_MODE=skip).` 가 기록됩니다.
+
+문제를 해결한 뒤에는 `VALIDATION_MODE=lint`(또는 `compile`/`full`) 로 되돌리는 것을 권장합니다.
+
+### 6-4. Discord 알림
 
 | 이벤트 | 색상 |
 | --- | --- |
@@ -276,6 +283,28 @@ Unity는 컴파일 에러가 있어도 종료 코드 0을 반환하는 경우가
 
 웹훅 전송 실패는 로그만 남기고 파이프라인을 중단시키지 않습니다.
 
+### 6-5. 진행 상태 (`state.json`) 및 재시도
+
+`runtime/state.json` 의 주요 `status` 값:
+
+| status | 의미 |
+| --- | --- |
+| `idle` | 대기 또는 부분 실행 범위만 완료 |
+| `in_progress` | Step 실행 중 |
+| `paused` | `Ctrl+C` 등으로 중단 — `currentStepId` 유지, 다음 `run` 에서 이어서 진행 |
+| `completed` | 마지막 Step 하나가 방금 끝남 (다음 Step 시작 전 transient) |
+| `needs_human` | 재시도 한도 초과 — 수동 확인 후 재실행 |
+| `all_completed` | 로드맵 **전체** Step 이 `completedSteps` 에 포함됨 |
+
+**부분 실행 (`--from` / `--to`)**  
+지정 범위의 Step 만 끝내도 `all_completed` 로 표시되지 않습니다. 로드맵 전 Step 이 완료될 때만 `all_completed` 및 파이프라인 완료 Discord 알림이 발생합니다.
+
+**재시도가 발생하는 경우** (최대 `MAX_RETRIES` 회):
+
+- Agent CLI 비정상 종료·타임아웃
+- 검수 실패 (변경 없음, 린트 위반, 컴파일/테스트 실패)
+- `AUTO_COMMIT=true` 인데 git commit 실패
+
 ---
 
 ## 7. 프로젝트 구조
@@ -283,16 +312,15 @@ Unity는 컴파일 에러가 있어도 종료 코드 0을 반환하는 경우가
 ```
 cursorAutoWork/
 ├─ src/
-│  ├─ index.ts           # CLI 진입점 (run / init / status / doctor)
+│  ├─ index.ts           # CLI 진입점 (run / preview-prompt / init / status / doctor)
 │  ├─ orchestrator.ts    # 메인 제어 루프, 재시도, 상태 관리
-│  ├─ cursorRunner.ts    # cursor-agent spawn, NDJSON 파싱, .cursorrules 수집
+│  ├─ cursorRunner.ts    # agent CLI spawn, NDJSON 파싱, .cursorrules 수집
 │  ├─ mcpProbe.ts        # mcp.json 병합 로딩, MCP 서버 라이브 핸드셰이크 점검
 │  ├─ unityValidator.ts  # Unity 배치모드 실행, CS 에러 파싱, NUnit XML 파싱
 │  ├─ gitManager.ts      # diff 수집, 컨벤션 정적 검사, 자동 커밋
 │  ├─ memoryManager.ts   # Fresh Context 프롬프트 조립, 요약 추출, state.json
 │  ├─ notifier.ts        # Discord Webhook Embed 전송
 │  ├─ roadmap.ts         # roadmap.json 로딩 및 스키마 검증
-│  ├─ subagents.ts       # .cursor/agents frontmatter 의 subagent 모델 동기화
 │  ├─ config.ts          # 환경 변수 로딩 및 사전 점검
 │  ├─ encoding.ts        # 콘솔 코드페이지 처리 및 자식 프로세스 출력 디코딩
 │  ├─ logger.ts          # 콘솔 + 파일 로거
@@ -315,12 +343,16 @@ cursorAutoWork/
 
 | 증상 | 원인 및 조치 |
 | --- | --- |
-| `cursor-agent 실행 실패: spawn ENOENT` / `'agent'은(는) 내부 또는 외부 명령... 아닙니다` | CLI가 PATH에 없습니다. 공식 실행 파일 이름은 `cursor-agent` 이며, `doctor` 가 `--version` 을 실제로 호출해 확인해 줍니다. 해결되지 않으면 `CURSOR_AGENT_BIN` 에 절대경로를 지정하세요. |
+| `agent` 실행 실패: spawn ENOENT / `'agent'은(는) 내부 또는 외부 명령... 아닙니다` | CLI가 PATH에 없습니다. [Cursor CLI 설치](https://cursor.com/docs/cli/installation) 후 `agent --version` 으로 확인하세요. `doctor` 도 동일하게 `--version` 을 호출합니다. 해결되지 않으면 `CURSOR_AGENT_BIN` 에 절대경로를 지정하세요. |
 | Unity가 즉시 종료하고 exit code가 0이 아님 | Unity Editor가 같은 프로젝트를 열어 둔 상태면 `Library` 락으로 배치모드가 실패합니다. 에디터를 닫고 실행하세요. 라이선스 미인증도 같은 증상입니다. |
 | 매번 "변경된 파일이 하나도 없습니다" 로 실패 | Agent가 파일을 쓰지 못하는 상태입니다. `CURSOR_YOLO=true` 인지, 대상 경로에 쓰기 권한이 있는지 확인하세요. |
 | 컴파일 검수가 계속 타임아웃 | 최초 임포트는 오래 걸립니다. Unity Editor로 프로젝트를 한 번 연 뒤 실행하거나 `UNITY_TIMEOUT_MS` 를 늘리세요. |
 | 한 Step에서 계속 재시도 후 중단 | Task 단위가 너무 큽니다. `roadmap.json` 의 Step을 더 잘게 나누세요. |
-| `cursor-agent 실행 오류: 명령줄이 너무 깁니다.` | Windows `cmd.exe` 의 8191자 명령행 상한입니다. `CURSOR_PROMPT_DELIVERY=auto`(기본값)면 stdin으로 자동 우회합니다. 그래도 실패하면 `file` 로 고정하세요 ([4-5](#4-5-프롬프트-전달-방식)). |
+| `agent` 실행 오류: 명령줄이 너무 깁니다. | Windows `cmd.exe` 의 8191자 명령행 상한입니다. `CURSOR_PROMPT_DELIVERY=auto`(기본값)면 stdin으로 자동 우회합니다. 그래도 실패하면 `file` 로 고정하세요 ([4-4](#4-4-프롬프트-전달-방식)). |
+| `Git 저장소가 아닙니다` (fatal) | `lint`/`compile`/`full` 은 Git Diff 검수가 필요합니다. 대상 프로젝트에서 `git init` 하거나 `VALIDATION_MODE=skip` 을 사용하세요. |
+| `agent` 가 exit code ≠ 0 으로 종료 | Agent 실행 자체 실패로 재시도합니다. CLI 인증(`CURSOR_API_KEY` 또는 [Authentication](https://cursor.com/docs/cli/reference/authentication))·`CURSOR_AGENT_BIN` 경로를 확인하세요. |
+| 검수 통과 후 커밋만 반복 실패 | `git` 권한·`.gitignore`·`GIT_AUTHOR_*` 설정을 확인하세요. Step 은 완료되지 않고 재시도됩니다. |
+| `status` 가 `paused` 로 멈춤 | `Ctrl+C` 로 중단된 상태입니다. 문제 없으면 `run` 을 다시 실행하면 `currentStepId` 부터 이어집니다. |
 | Agent가 Task 지시의 일부만 수행함 | 여러 줄 프롬프트가 명령행에서 잘렸을 수 있습니다. `CURSOR_PROMPT_DELIVERY` 를 `argv` 로 강제하지 마세요. |
 | 콘솔 한글이 깨짐 | 실행 시 자동으로 `chcp 65001` 을 적용하지만, 일부 터미널에서는 수동으로 UTF-8 코드페이지를 설정해야 합니다. 로그 파일(`runtime/orchestrator.log`)은 항상 UTF-8입니다. |
 | 로그의 오류 메시지가 `����` 로 나옴 | 자식 프로세스가 로컬 코드페이지(한국어 949 등)로 출력한 경우입니다. 현재는 UTF-8 → 콘솔 코드페이지 순으로 디코딩해 복원하므로, 재현되면 이슈로 알려주세요. |
