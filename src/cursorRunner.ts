@@ -4,17 +4,20 @@ import path from 'node:path';
 
 import { ConsoleTail } from './encoding';
 import { createLogger } from './logger';
+import { killChildTree } from './processKill';
+import { budgetText } from './textBudget';
 import type {
   AgentRunResult,
   AgentStreamEvent,
   OrchestratorConfig,
   PromptDelivery,
+  TokenUsage,
 } from './types';
 
 const log = createLogger('cursor');
 
 /** `.cursorrules` / `.cursor/rules/*.mdc` 를 모두 읽어 System Context 로 합친다. */
-export function collectCursorRules(projectRoot: string, maxChars = 12_000): string {
+export function collectCursorRules(projectRoot: string, maxChars = 40_000): string {
   const chunks: string[] = [];
 
   const legacy = path.join(projectRoot, '.cursorrules');
@@ -41,10 +44,7 @@ export function collectCursorRules(projectRoot: string, maxChars = 12_000): stri
 
   if (chunks.length === 0) return '';
 
-  const joined = chunks.join('\n\n');
-  return joined.length > maxChars
-    ? `${joined.slice(0, maxChars)}\n\n[...규칙 문서가 길어 일부 생략됨...]`
-    : joined;
+  return budgetText(chunks.join('\n\n'), maxChars, '규칙 문서');
 }
 
 export interface RunAgentOptions {
@@ -56,6 +56,12 @@ export interface RunAgentOptions {
   onText?: (text: string) => void;
   /** 도구 호출 감지 시 호출 */
   onToolCall?: (toolName: string) => void;
+  /** 중단 시 Agent 프로세스 트리를 즉시 종료 */
+  signal?: AbortSignal;
+  /** 미지정 시 config.cursorYolo */
+  yolo?: boolean;
+  /** 미지정 시 config.agentTimeoutMs */
+  timeoutMs?: number;
 }
 
 /** `auto` 가 실제로 선택하는 구체적인 전달 방식 */
@@ -134,7 +140,7 @@ function buildArgs(
 
   if (config.cursorModel) args.push('--model', config.cursorModel);
   // UnityMCP 도구 호출 및 파일 쓰기를 사람 승인 없이 자율 수행하도록 허용
-  if (config.cursorYolo) args.push('--force');
+  if (options.yolo ?? config.cursorYolo) args.push('--force');
 
   return args;
 }
@@ -192,8 +198,75 @@ export function probeCursorAgent(
   });
 }
 
+export interface CursorAuthProbe {
+  ok: boolean;
+  checked: boolean;
+  detail: string;
+}
+
+const AUTH_FAIL = /not (?:logged|signed) in|login required|unauthoriz|401|authentication required|please (?:log|sign) in|no api key/i;
+
+function runAgentSubcommand(
+  config: OrchestratorConfig,
+  args: string[],
+  timeoutMs: number,
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(config.cursorAgentBin, args, {
+      shell: useShell(),
+      windowsHide: true,
+    });
+    const stdout = new ConsoleTail(6_000);
+    const stderr = new ConsoleTail(6_000);
+    const timer = setTimeout(() => {
+      killChildTree(child);
+      resolve({ code: null, stdout: stdout.toString(), stderr: 'timeout' });
+    }, timeoutMs);
+    child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+    child.stdin.end();
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      resolve({ code: null, stdout: '', stderr: error.message });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout: stdout.toString(), stderr: stderr.toString() });
+    });
+  });
+}
+
+/** `--version` 외에 status/whoami 로 로그인 여부를 본다. 없는 서브커맨드는 건너뛴다. */
+export async function probeCursorAuth(
+  config: OrchestratorConfig,
+  timeoutMs = 12_000,
+): Promise<CursorAuthProbe> {
+  for (const args of [['status'], ['whoami'], ['account']]) {
+    const result = await runAgentSubcommand(config, args, timeoutMs);
+    const combined = `${result.stdout}\n${result.stderr}`;
+    if (/unknown command|no such command|unrecognized/i.test(combined)) continue;
+    if (result.stderr === 'timeout') continue;
+    if (AUTH_FAIL.test(combined) || (result.code !== 0 && result.code !== null && AUTH_FAIL.test(combined))) {
+      return { ok: false, checked: true, detail: combined.replace(/\s+/g, ' ').trim().slice(0, 240) };
+    }
+    if (result.code === 0) {
+      const line = result.stdout.trim().split(/\r?\n/)[0]?.trim() || '인증 확인됨';
+      return { ok: true, checked: true, detail: line.slice(0, 200) };
+    }
+    if (AUTH_FAIL.test(combined)) {
+      return { ok: false, checked: true, detail: combined.replace(/\s+/g, ' ').trim().slice(0, 240) };
+    }
+  }
+
+  return {
+    ok: true,
+    checked: false,
+    detail: 'status/whoami 를 지원하지 않아 인증은 실행 시점에 확인됩니다.',
+  };
+}
+
 const PROMPT_DIR_NAME = 'prompts';
-const KEEP_PROMPT_FILES = 20;
+const KEEP_PROMPT_FILES = 3;
 
 /** 프롬프트 본문을 runtime/prompts 에 저장하고 경로를 돌려준다. */
 function writePromptFile(config: OrchestratorConfig, prompt: string): string {
@@ -296,8 +369,35 @@ function resolveDelivery(options: RunAgentOptions): ResolvedDelivery {
   return 'stdin';
 }
 
+/** NDJSON 이벤트에서 토큰 사용량을 읽는다. 한 실행에서는 마지막 값을 쓴다. */
+export function extractUsage(event: AgentStreamEvent): TokenUsage | null {
+  const rec = event as Record<string, unknown>;
+  const nested =
+    rec.usage ??
+    rec.token_usage ??
+    (rec.message && typeof rec.message === 'object'
+      ? (rec.message as Record<string, unknown>).usage
+      : undefined) ??
+    (rec.result && typeof rec.result === 'object'
+      ? (rec.result as Record<string, unknown>).usage
+      : undefined);
+  if (!nested || typeof nested !== 'object') return null;
+  const usage = nested as Record<string, unknown>;
+  const input = Number(usage.input_tokens ?? usage.prompt_tokens ?? usage.inputTokens ?? 0);
+  const output = Number(usage.output_tokens ?? usage.completion_tokens ?? usage.outputTokens ?? 0);
+  const total = Number(usage.total_tokens ?? usage.totalTokens ?? 0);
+  if (input > 0 || output > 0) {
+    return {
+      inputTokens: Number.isFinite(input) ? input : 0,
+      outputTokens: Number.isFinite(output) ? output : 0,
+    };
+  }
+  if (total > 0) return { inputTokens: total, outputTokens: 0 };
+  return null;
+}
+
 /** NDJSON 이벤트에서 사람이 읽을 수 있는 텍스트를 추출한다. */
-function extractText(event: AgentStreamEvent): string {
+export function extractText(event: AgentStreamEvent): string {
   const fromContent = (content: unknown): string => {
     if (typeof content === 'string') return content;
     if (Array.isArray(content)) {
@@ -357,10 +457,25 @@ function extractToolName(event: AgentStreamEvent): string | null {
  * 단일 전달 방식으로 agent 를 한 번 실행한다.
  * NDJSON 스트림을 소비하고, 프로세스가 idle/exit 될 때까지 대기한다.
  */
+function emptyAborted(startedAt: number, stderr = ''): AgentRunResult {
+  return {
+    exitCode: null,
+    assistantText: '',
+    toolCalls: [],
+    timedOut: false,
+    aborted: true,
+    stderr,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 function runOnce(options: RunAgentOptions, plan: SpawnPlan): Promise<AgentRunResult> {
-  const { config } = options;
+  const { config, signal } = options;
   const { args } = plan;
   const startedAt = Date.now();
+  const timeoutMs = options.timeoutMs ?? config.agentTimeoutMs;
+
+  if (signal?.aborted) return Promise.resolve(emptyAborted(startedAt, '이미 중단된 실행입니다.'));
 
   log.info(
     `agent 실행 (${options.resumeSessionId ? `resume:${options.resumeSessionId}` : 'fresh context'}, prompt=${plan.delivery}) - prompt ${options.prompt.length} chars`,
@@ -385,18 +500,32 @@ function runOnce(options: RunAgentOptions, plan: SpawnPlan): Promise<AgentRunRes
     const stderrTail = new ConsoleTail(20_000);
     let spawnErrorMessage = '';
     let sessionId: string | undefined;
+    let usage: TokenUsage | undefined;
     let buffer = '';
     let timedOut = false;
     let settled = false;
 
+    let aborted = false;
+
     const timer = setTimeout(() => {
       timedOut = true;
-      log.error(`Agent 타임아웃 (${config.agentTimeoutMs}ms) - 프로세스를 종료합니다.`);
-      child.kill('SIGKILL');
-    }, config.agentTimeoutMs);
+      log.error(`Agent 타임아웃 (${timeoutMs}ms) - 프로세스를 종료합니다.`);
+      killChildTree(child);
+    }, timeoutMs);
+
+    const onAbort = (): void => {
+      if (settled) return;
+      aborted = true;
+      log.warn('중단 요청 — Agent 프로세스 트리를 종료합니다.');
+      killChildTree(child);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
 
     const handleEvent = (event: AgentStreamEvent): void => {
       if (typeof event.session_id === 'string') sessionId = event.session_id;
+      const nextUsage = extractUsage(event);
+      if (nextUsage) usage = nextUsage;
 
       const toolName = extractToolName(event);
       if (toolName) {
@@ -459,6 +588,7 @@ function runOnce(options: RunAgentOptions, plan: SpawnPlan): Promise<AgentRunRes
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       if (buffer.trim()) consumeLine(buffer);
 
       const result: AgentRunResult = {
@@ -467,11 +597,16 @@ function runOnce(options: RunAgentOptions, plan: SpawnPlan): Promise<AgentRunRes
         toolCalls,
         sessionId,
         timedOut,
+        aborted,
         stderr: `${stderrTail.toString()}${spawnErrorMessage}`.trim(),
         durationMs: Date.now() - startedAt,
+        usage,
       };
+      const usageLabel = usage
+        ? `, tokens=${usage.inputTokens}+${usage.outputTokens}`
+        : '';
       log.info(
-        `agent 종료 (code=${exitCode}, ${Math.round(result.durationMs / 1000)}s, tools=${toolCalls.length})`,
+        `agent 종료 (code=${exitCode}, ${Math.round(result.durationMs / 1000)}s, tools=${toolCalls.length}${usageLabel})`,
       );
       resolve(result);
     };
@@ -498,8 +633,11 @@ function looksLikeCommandLineOverflow(stderr: string): boolean {
  * `auto` 모드에서 stdin 전달이 즉시 실패하면 파일 전달로 한 번 더 시도한다.
  */
 export async function runCursorAgent(options: RunAgentOptions): Promise<AgentRunResult> {
+  if (options.signal?.aborted) return emptyAborted(Date.now(), '이미 중단된 실행입니다.');
+
   const delivery = resolveDelivery(options);
   const result = await runOnce(options, buildPlan(options, delivery));
+  if (result.aborted) return result;
 
   const failedWithoutOutput =
     !result.timedOut && result.exitCode !== 0 && result.assistantText.trim() === '';

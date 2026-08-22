@@ -2,9 +2,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { describeValidationMode, ensureRuntimeDirs, loadConfig, validateConfig } from './config';
+import { describeValidationMode, ensureRuntimeDirs, loadConfig, needsUnity, validateConfig } from './config';
 import type { ValidationIssue } from './config';
-import { collectCursorRules, probeCursorAgent } from './cursorRunner';
+import { parseArgs, type ParsedArgs } from './cliArgs';
+import { collectCursorRules, probeCursorAgent, probeCursorAuth } from './cursorRunner';
+import { ensureLiveEditor } from './editorGate';
 import { enableUtf8Console } from './encoding';
 import { closeLogger, configureLogger, createLogger } from './logger';
 import { formatProbeResult, loadMcpServers, probeMcpServers } from './mcpProbe';
@@ -12,34 +14,10 @@ import type { McpProbeResult } from './mcpProbe';
 import { buildStepPrompt, loadState } from './memoryManager';
 import { Orchestrator, selectPreviewSteps } from './orchestrator';
 import { loadRoadmap } from './roadmap';
+import { acquireRunLock, RunLockError } from './runLock';
 import type { OrchestratorConfig, ValidationMode } from './types';
 
 const log = createLogger('cli');
-
-interface ParsedArgs {
-  command: string;
-  flags: Record<string, string | boolean>;
-}
-
-function parseArgs(argv: string[]): ParsedArgs {
-  const [command = 'run', ...rest] = argv;
-  const flags: Record<string, string | boolean> = {};
-
-  for (let i = 0; i < rest.length; i += 1) {
-    const token = rest[i];
-    if (!token?.startsWith('--')) continue;
-    const key = token.slice(2);
-    const next = rest[i + 1];
-    if (next && !next.startsWith('--')) {
-      flags[key] = next;
-      i += 1;
-    } else {
-      flags[key] = true;
-    }
-  }
-
-  return { command, flags };
-}
 
 function numberFlag(flags: ParsedArgs['flags'], key: string): number | undefined {
   const value = flags[key];
@@ -66,6 +44,7 @@ Unity & Cursor Headless CLI 오케스트레이터
 
 사용법:
   cursor-auto-work <command> [options]
+  cursor-auto-work [options] <command>
 
 Commands:
   run              roadmap.json 기준으로 파이프라인을 실행합니다 (기본값)
@@ -77,23 +56,31 @@ Commands:
 
 Options:
   --project <path>       TARGET_PROJECT_PATH 를 덮어씁니다
-  --from <n>             Step n 부터 (preview: 완료 기록 무시)
+  --from <n>             Step n 부터 (완료 Step 은 건너뜀)
   --to <n>               Step n 까지만
+  --force-rerun          완료된 Step 도 다시 실행
   --retries <n>          MAX_RETRIES 덮어쓰기
   --validation <mode>    lint | compile | full | skip (VALIDATION_MODE 덮어쓰기)
   --no-commit            자동 커밋 비활성화
   --debug                로그 레벨을 debug 로 설정
   --no-mcp-probe         MCP 서버 실제 접속 점검을 생략 (doctor, run)
   --mcp-timeout <ms>     MCP 응답 대기 시간 (기본 20000)
+  --no-infer-verify      targetFiles/완료 조건에서 verify 추론 끄기
+  --no-judge             완료 조건 판정 Agent 끄기
+  --no-launch-editor     에디터 자동 기동 끄기
+  --no-resume            재시도 시 세션 resume 끄기
 
 검수 모드 (VALIDATION_MODE):
-  lint     Git Diff + 컨벤션 린트 (기본값)
-  compile  lint + Unity Batchmode 컴파일
-  full     lint + 컴파일 + EditMode 테스트 (roadmap step.runTests=true 일 때)
+  lint     Verify 체크 + 이번 Step delta 린트
+  compile  lint + 열린 Unity Editor(MCP) 컴파일 (기본값)
+  full     lint + 에디터 컴파일 + EditMode 테스트 (roadmap step.runTests=true 일 때)
   skip     검수 생략 (diff 수집만)
 
-예시:
+  compile/full 은 에디터를 끄지 않습니다. 구 배치모드는 UNITY_VALIDATION_BACKEND=batch
+
+  예시:
   cursor-auto-work run --project D:\\UnityProjects\\MyGame
+  cursor-auto-work --project D:\\UnityProjects\\MyGame run
   cursor-auto-work run --validation full
   cursor-auto-work preview-prompt --to 1
   cursor-auto-work doctor
@@ -110,6 +97,10 @@ function buildConfig(flags: ParsedArgs['flags']): OrchestratorConfig {
   const validationMode = parseValidationFlag(flags);
   if (validationMode !== undefined) overrides.validationMode = validationMode;
   if (flags['no-commit'] === true) overrides.autoCommit = false;
+  if (flags['no-infer-verify'] === true) overrides.inferVerify = false;
+  if (flags['no-judge'] === true) overrides.stepJudge = false;
+  if (flags['no-launch-editor'] === true) overrides.unityLaunchEditor = false;
+  if (flags['no-resume'] === true) overrides.resumeOnRetry = false;
   if (flags.debug === true) overrides.logLevel = 'debug';
 
   return loadConfig(overrides);
@@ -240,6 +231,7 @@ function commandPreviewPrompt(config: OrchestratorConfig, flags: ParsedArgs['fla
     state,
     numberFlag(flags, 'from'),
     numberFlag(flags, 'to'),
+    flags['force-rerun'] === true,
   );
 
   if (steps.length === 0) {
@@ -292,7 +284,7 @@ async function commandDoctor(
   flags: ParsedArgs['flags'],
 ): Promise<number> {
   const issues = validateConfig(config);
-  const rules = collectCursorRules(config.targetProjectPath);
+  const rules = collectCursorRules(config.targetProjectPath, config.rulesMaxChars);
   const servers = loadMcpServers(config.targetProjectPath);
   const skipProbe = flags['no-mcp-probe'] === true;
 
@@ -304,6 +296,16 @@ async function commandDoctor(
     });
   }
 
+  const authProbe = agentProbe.ok
+    ? await probeCursorAuth(config)
+    : { ok: false, checked: false, detail: 'CLI 실행 실패로 인증을 건너뜀' };
+  if (authProbe.checked && !authProbe.ok) {
+    issues.push({
+      fatal: true,
+      message: `Cursor CLI 인증이 없습니다: ${authProbe.detail}`,
+    });
+  }
+
   const lines = [
     '',
     '=== 환경 점검 ===',
@@ -311,10 +313,17 @@ async function commandDoctor(
     `Unity 실행 파일 : ${config.unityPath || '(미설정)'}`,
     `agent (CLI)     : ${config.cursorAgentBin}${config.cursorYolo ? ' (--force 자동 승인)' : ''}`,
     `  └ 실행 확인   : ${agentProbe.ok ? agentProbe.version : `실패 - ${agentProbe.error}`}`,
+    `  └ 인증        : ${authProbe.checked ? (authProbe.ok ? authProbe.detail : `실패 - ${authProbe.detail}`) : authProbe.detail}`,
     `모델            : ${config.cursorModel || '(CLI 기본값)'}`,
     `프롬프트 전달   : ${config.promptDelivery}`,
     `검수 모드       : ${config.validationMode} (${describeValidationMode(config)})`,
+    `Unity 검수 채널 : ${config.unityValidationBackend === 'batch' ? 'batch (에디터 종료)' : 'mcp (열린 에디터)'}`,
+    `에디터 자동 기동 : ${config.unityLaunchEditor ? '활성' : '비활성'}`,
     `자동 커밋       : ${config.autoCommit ? '활성' : '비활성'}`,
+    `재시도 resume   : ${config.resumeOnRetry ? '활성' : '비활성'}`,
+    `실패 롤백       : ${config.rollbackOnFail ? '활성' : '비활성'}`,
+    `verify 추론     : ${config.inferVerify ? '활성 (로드맵을 고치지 않음)' : '비활성'}`,
+    `완료 조건 판정  : ${config.stepJudge ? `활성 (${config.judgeTimeoutMs}ms)` : '비활성'}`,
     `기획서          : ${config.specPath}`,
     `로드맵          : ${config.roadmapPath}`,
     `상태 파일       : ${config.statePath}`,
@@ -362,34 +371,69 @@ async function commandRun(config: OrchestratorConfig, flags: ParsedArgs['flags']
     return 1;
   }
 
-  if (flags['no-mcp-probe'] !== true) {
-    const results = await probeMcpServers(
-      config.targetProjectPath,
-      numberFlag(flags, 'mcp-timeout') ?? 20_000,
-    );
-    for (const result of results) {
-      if (result.skipped) continue;
-      if (!result.ok) log.warn(`MCP '${result.name}' 응답 없음: ${result.error}`);
-      else if (result.warning) log.warn(`MCP '${result.name}': ${result.warning}`);
-      else log.info(`MCP '${result.name}' 정상 (도구 ${result.toolCount ?? 0}개)`);
+  let releaseLock: (() => void) | undefined;
+  try {
+    releaseLock = acquireRunLock(config.runtimeDir, config.targetProjectPath);
+  } catch (error) {
+    if (error instanceof RunLockError) {
+      log.error(error.message);
+      return 1;
     }
+    throw error;
   }
 
-  const orchestrator = new Orchestrator(config);
-
-  const onSignal = () => orchestrator.requestStop();
-  process.on('SIGINT', onSignal);
-  process.on('SIGTERM', onSignal);
-
   try {
-    await orchestrator.run({
-      fromStep: numberFlag(flags, 'from'),
-      toStep: numberFlag(flags, 'to'),
-    });
-    return 0;
+    if (flags['no-mcp-probe'] !== true) {
+      const results = await probeMcpServers(
+        config.targetProjectPath,
+        numberFlag(flags, 'mcp-timeout') ?? 20_000,
+      );
+      for (const result of results) {
+        if (result.skipped) continue;
+        if (!result.ok) log.warn(`MCP '${result.name}' 응답 없음: ${result.error}`);
+        else if (result.warning) log.warn(`MCP '${result.name}': ${result.warning}`);
+        else log.info(`MCP '${result.name}' 정상 (도구 ${result.toolCount ?? 0}개)`);
+      }
+
+      if (needsUnity(config) && config.unityValidationBackend === 'mcp') {
+        const unity = results.find((item) => /unity/i.test(item.name));
+        if (unity && !unity.ok && !unity.skipped) {
+          log.error(`UnityMCP 가 응답하지 않습니다: ${unity.error ?? '알 수 없는 실패'}`);
+          log.error('Agent 를 시작하지 않습니다. 에디터와 UnityMCP 를 확인하세요.');
+          return 1;
+        }
+      }
+    }
+
+    if (needsUnity(config) && config.unityValidationBackend === 'mcp') {
+      const gate = await ensureLiveEditor(config);
+      if (!gate.ok) {
+        log.error(gate.message);
+        log.error('에디터/UnityMCP 가 준비되지 않아 Agent 를 시작하지 않습니다.');
+        return 1;
+      }
+      log.info(gate.message);
+    }
+
+    const orchestrator = new Orchestrator(config);
+
+    const onSignal = () => orchestrator.requestStop();
+    process.on('SIGINT', onSignal);
+    process.on('SIGTERM', onSignal);
+
+    try {
+      await orchestrator.run({
+        fromStep: numberFlag(flags, 'from'),
+        toStep: numberFlag(flags, 'to'),
+        forceRerun: flags['force-rerun'] === true,
+      });
+      return orchestrator.wasAborted() ? 130 : 0;
+    } finally {
+      process.off('SIGINT', onSignal);
+      process.off('SIGTERM', onSignal);
+    }
   } finally {
-    process.off('SIGINT', onSignal);
-    process.off('SIGTERM', onSignal);
+    releaseLock();
   }
 }
 

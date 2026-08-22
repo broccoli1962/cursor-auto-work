@@ -1,5 +1,25 @@
 import { needsUnity, describeValidationMode } from './config';
-import { collectDiff, commitAll, ensureGitRepo, ensureUnityGitignore } from './gitManager';
+import {
+  collectDiff,
+  commitAll,
+  diffSinceSnapshot,
+  ensureGitRepo,
+  ensureUnityGitignore,
+  ensureWorkBranch,
+  hasMeaningfulEdits,
+  restoreFilesSinceSnapshot,
+  selectCommitFiles,
+  snapshotWorkingTree,
+} from './gitManager';
+import {
+  contractResult,
+  inferVerifyChecks,
+  meaningfulChangesResult,
+  mergeVerifyChecks,
+  skippedJudgeResult,
+} from './inferVerify';
+import { formatJudgeFeedback, runStepJudge } from './stepJudge';
+import type { WorkingTreeSnapshot } from './gitManager';
 import { runCursorAgent } from './cursorRunner';
 import { createLogger } from './logger';
 import {
@@ -11,12 +31,21 @@ import {
 } from './memoryManager';
 import { Notifier } from './notifier';
 import { loadRoadmap } from './roadmap';
+import {
+  formatVerifyFeedback,
+  requireChangesResult,
+  resolveVerifyScope,
+  runVerifyChecks,
+  shouldRequireChanges,
+} from './stepVerifier';
 import type {
   AgentRunResult,
   OrchestratorConfig,
   OrchestratorState,
   Roadmap,
+  GitDiffResult,
   RoadmapStep,
+  TokenUsage,
   ValidationMode,
   ValidationReport,
 } from './types';
@@ -32,10 +61,12 @@ import {
 const log = createLogger('orchestrator');
 
 export interface RunOptions {
-  /** 지정한 Step 부터 시작 (state.json 무시) */
+  /** 이 Step id 이상만 대상. 완료된 Step 은 --force-rerun 없이 건너뛴다. */
   fromStep?: number;
   /** 이 Step 까지만 실행 */
   toStep?: number;
+  /** 완료된 Step 도 다시 실행 */
+  forceRerun?: boolean;
 }
 
 export class Orchestrator {
@@ -51,6 +82,10 @@ export class Orchestrator {
 
   private stopRequested = false;
 
+  private forceRerun = false;
+
+  private runAbort = new AbortController();
+
   constructor(config: OrchestratorConfig) {
     this.config = config;
     this.roadmap = loadRoadmap(config.roadmapPath);
@@ -58,17 +93,32 @@ export class Orchestrator {
     this.notifier = new Notifier(config, this.roadmap.project);
   }
 
-  /** Ctrl+C 등으로 현재 Step 종료 후 안전하게 멈추도록 요청한다. */
+  /** Ctrl+C 등으로 실행 중인 Agent/검수를 즉시 끊고 파이프라인을 일시 중지한다. */
   requestStop(): void {
-    if (this.stopRequested) return;
+    if (this.stopRequested) {
+      log.warn('중단이 반복되어 프로세스를 종료합니다.');
+      process.exit(130);
+    }
     this.stopRequested = true;
-    log.warn('중단 요청 수신 - 현재 Step 을 마치는 대로 종료합니다.');
+    this.runAbort.abort();
+    log.warn('중단 요청 — 실행 중인 Agent/검수 연결을 끊습니다. Unity Editor 는 유지합니다.');
+  }
+
+  wasAborted(): boolean {
+    return this.stopRequested;
   }
 
   async run(options: RunOptions = {}): Promise<void> {
     const startedAt = Date.now();
+    this.stopRequested = false;
+    this.runAbort = new AbortController();
+    this.forceRerun = options.forceRerun === true;
     this.gitAvailable = await ensureGitRepo(this.config);
-    if (this.gitAvailable) ensureUnityGitignore(this.config);
+    if (this.gitAvailable) {
+      ensureUnityGitignore(this.config);
+      const branch = await ensureWorkBranch(this.config);
+      if (branch) this.state.workBranch = branch;
+    }
 
     if (this.config.validationMode === 'skip') {
       log.warn('VALIDATION_MODE=skip - 검수 없이 Step 을 통과 처리합니다 (커밋 본문에만 기록).');
@@ -76,7 +126,20 @@ export class Orchestrator {
       log.info(`검수 모드: ${this.config.validationMode} (${describeValidationMode(this.config)})`);
     }
 
-    const steps = this.selectSteps(options);
+    const steps = selectRunnableSteps(this.roadmap, this.state, options);
+    if (!options.forceRerun && this.state.completedSteps.length > 0) {
+      const skipped = this.roadmap.steps.filter(
+        (step) =>
+          this.state.completedSteps.includes(step.id) &&
+          (options.fromStep === undefined || step.id >= options.fromStep) &&
+          (options.toStep === undefined || step.id <= options.toStep),
+      );
+      if (skipped.length > 0) {
+        log.info(
+          `완료된 Step ${skipped.map((step) => step.id).join(', ')} 는 건너뜁니다. 다시 실행하려면 --force-rerun`,
+        );
+      }
+    }
     if (steps.length === 0) {
       log.info('실행할 Step 이 없습니다. 모든 작업이 이미 완료되었습니다.');
       if (this.isAllStepsCompleted()) {
@@ -99,6 +162,7 @@ export class Orchestrator {
 
       const succeeded = await this.runStep(step);
       if (!succeeded) {
+        this.logUsage();
         if (this.stopRequested) {
           this.pausePipeline(`Step ${step.id} 처리 중 중단 요청`);
           return;
@@ -115,6 +179,8 @@ export class Orchestrator {
       return;
     }
 
+    this.logUsage();
+
     if (this.isAllStepsCompleted()) {
       this.state.status = 'all_completed';
       this.state.currentStepId = null;
@@ -124,6 +190,7 @@ export class Orchestrator {
         this.state.completedSteps.length,
         this.roadmap.steps.length,
         Date.now() - startedAt,
+        this.state.usage,
       );
     } else {
       this.state.status = 'idle';
@@ -132,6 +199,14 @@ export class Orchestrator {
         `실행 범위 Step 완료 (${this.state.completedSteps.length}/${this.roadmap.steps.length} 전체 완료)`,
       );
     }
+  }
+
+  private logUsage(): void {
+    const usage = this.state.usage;
+    if (!usage || usage.runs === 0) return;
+    log.info(
+      `토큰 합계: in ${usage.inputTokens} / out ${usage.outputTokens} (${usage.runs}회 Agent 실행)`,
+    );
   }
 
   private isAllStepsCompleted(): boolean {
@@ -144,22 +219,6 @@ export class Orchestrator {
     log.warn(`${reason} — 파이프라인을 일시 중지했습니다 (status=paused).`);
   }
 
-  private selectSteps(options: RunOptions): RoadmapStep[] {
-    let steps = this.roadmap.steps;
-
-    if (options.fromStep !== undefined) {
-      steps = steps.filter((step) => step.id >= options.fromStep!);
-    } else {
-      steps = steps.filter((step) => !this.state.completedSteps.includes(step.id));
-    }
-
-    if (options.toStep !== undefined) {
-      steps = steps.filter((step) => step.id <= options.toStep!);
-    }
-
-    return steps;
-  }
-
   /** 한 Step 을 재시도 한도 내에서 수행한다. 성공하면 true. */
   private async runStep(step: RoadmapStep): Promise<boolean> {
     const stepStartedAt = Date.now();
@@ -169,6 +228,9 @@ export class Orchestrator {
     this.state.currentStepId = step.id;
     this.state.status = 'in_progress';
     saveState(this.config, this.state);
+
+    const baseline = await snapshotWorkingTree(this.config);
+    let lastSessionId: string | undefined;
 
     for (let attempt = 1; attempt <= this.config.maxRetries; attempt += 1) {
       if (this.stopRequested) {
@@ -190,7 +252,18 @@ export class Orchestrator {
         attempt,
       });
 
-      const agentResult = await this.runAgent(prompt);
+      const resume =
+        this.config.resumeOnRetry && attempt > 1 && lastSessionId ? lastSessionId : undefined;
+      const agentResult = await this.runAgent(prompt, resume);
+      lastSessionId = agentResult.sessionId ?? lastSessionId;
+      this.recordUsage(agentResult.usage);
+
+      if (agentResult.aborted || this.stopRequested) {
+        appendMemory(this.state, buildStepMemory(step, agentResult, null, attempt));
+        this.state.lastError = '사용자 중단 (Ctrl+C)';
+        saveState(this.config, this.state);
+        return false;
+      }
 
       if (agentResult.exitCode !== 0 || agentResult.timedOut) {
         feedback = this.describeAgentFailure(agentResult);
@@ -202,10 +275,17 @@ export class Orchestrator {
         continue;
       }
 
-      const report = await this.validate(step);
+      const report = await this.validate(step, baseline);
+
+      if (this.stopRequested || report.compile.aborted || report.tests.aborted || report.judge.aborted) {
+        appendMemory(this.state, buildStepMemory(step, agentResult, report, attempt));
+        this.state.lastError = '사용자 중단 (Ctrl+C)';
+        saveState(this.config, this.state);
+        return false;
+      }
 
       if (report.ok) {
-        const commitResult = await this.commitStep(step, report);
+        const commitResult = await this.commitStep(step, report, baseline);
         if (commitResult.failed) {
           feedback = commitResult.feedback;
           appendMemory(this.state, buildStepMemory(step, agentResult, report, attempt));
@@ -223,7 +303,7 @@ export class Orchestrator {
           step.id,
           step.title,
           commitResult.hash,
-          report.diff.changedFiles,
+          report.delta.changedFiles,
           Date.now() - stepStartedAt,
         );
         return true;
@@ -245,14 +325,34 @@ export class Orchestrator {
       step.title,
       feedback ?? '알 수 없는 사유로 검수를 통과하지 못했습니다.',
     );
+    await this.rollbackFailedStep(step, baseline);
     return false;
   }
 
-  private async runAgent(prompt: string): Promise<AgentRunResult> {
+  private recordUsage(usage?: TokenUsage): void {
+    if (!usage) return;
+    if (!this.state.usage) this.state.usage = { inputTokens: 0, outputTokens: 0, runs: 0 };
+    this.state.usage.inputTokens += usage.inputTokens;
+    this.state.usage.outputTokens += usage.outputTokens;
+    this.state.usage.runs += 1;
+  }
+
+  private async rollbackFailedStep(step: RoadmapStep, baseline: WorkingTreeSnapshot): Promise<void> {
+    if (!this.config.rollbackOnFail || !this.gitAvailable || this.stopRequested) return;
+    const latest = await diffSinceSnapshot(this.config, baseline, resolveVerifyScope(step));
+    const restored = await restoreFilesSinceSnapshot(this.config, baseline, latest.changedFiles);
+    if (restored.length > 0) {
+      log.warn(`Step ${step.id} 실패 롤백 (${restored.length}개): ${restored.slice(0, 8).join(', ')}`);
+    }
+  }
+
+  private async runAgent(prompt: string, resumeSessionId?: string): Promise<AgentRunResult> {
     let streamed = 0;
     return runCursorAgent({
       prompt,
       config: this.config,
+      resumeSessionId,
+      signal: this.runAbort.signal,
       onText: (text) => {
         streamed += text.length;
         if (this.config.logLevel === 'debug') process.stdout.write(text);
@@ -304,26 +404,18 @@ export class Orchestrator {
       compile: skippedCompileResult(this.config, 'VALIDATION_MODE=skip 로 컴파일 검수를 건너뛰었습니다.'),
       tests: skippedTestResult(),
       diff,
+      delta: { hasChanges: diff.hasChanges, changedFiles: diff.changedFiles },
+      checks: [],
+      judge: skippedJudgeResult('VALIDATION_MODE=skip'),
       feedback: '',
     };
   }
 
-  private lintProblems(diff: Awaited<ReturnType<typeof collectDiff>>): string[] {
-    const problems: string[] = [];
-
-    if (!diff.hasChanges) {
-      problems.push(
-        '변경된 파일이 하나도 없습니다. Agent 가 파일을 쓰지 못했거나 작업이 완료되지 않았습니다. CURSOR_YOLO=true 및 대상 경로 쓰기 권한을 확인하세요.',
-      );
-    }
-
-    if (diff.violations.length > 0) {
-      problems.push(
-        `린트/컨벤션 위반이 감지되었습니다:\n${diff.violations.map((item) => `- ${item}`).join('\n')}`,
-      );
-    }
-
-    return problems;
+  private lintProblems(diff: GitDiffResult): string[] {
+    if (diff.violations.length === 0) return [];
+    return [
+      `린트/컨벤션 위반이 감지되었습니다:\n${diff.violations.map((item) => `- ${item}`).join('\n')}`,
+    ];
   }
 
   private shouldRunUnityCompile(): boolean {
@@ -334,30 +426,57 @@ export class Orchestrator {
     return this.config.validationMode === 'full' && step.runTests === true;
   }
 
-  /** Git Diff 린트 → (선택) 컴파일 → (선택) 테스트 순서로 검수 */
-  private async validate(step: RoadmapStep): Promise<ValidationReport> {
+  /** 추론/명시 Verify → 린트 → 컴파일 → 테스트 → 판정 Agent (AND) */
+  private async validate(step: RoadmapStep, baseline: WorkingTreeSnapshot): Promise<ValidationReport> {
     if (this.config.validationMode === 'skip') return this.skipValidation(step);
 
-    await this.notifier.validating(step.id, 'Git Diff 린트 검사 중...');
-    const diff = await collectDiff(this.config);
+    const scope = resolveVerifyScope(step);
+    const scopeLabel = scope ? scope.join(', ') : '(전체)';
+
+    await this.notifier.validating(step.id, 'Verify / Git Diff 린트 검사 중...');
+    const diff = await diffSinceSnapshot(this.config, baseline, scope);
+    const delta = { hasChanges: diff.hasChanges, changedFiles: diff.changedFiles };
+
+    const inferred = this.config.inferVerify ? inferVerifyChecks(step) : [];
+    const merged = mergeVerifyChecks(inferred, step.verify?.checks ?? []);
+    const checks = runVerifyChecks(this.config.targetProjectPath, merged);
+    checks.push(contractResult(step, inferred));
+    const requireChanges = shouldRequireChanges(step, this.forceRerun);
+    if (requireChanges) {
+      checks.push(requireChangesResult(delta.hasChanges, scopeLabel));
+      if (delta.hasChanges) {
+        const meaningful = await hasMeaningfulEdits(this.config, diff.changedFiles);
+        checks.push(meaningfulChangesResult(meaningful, scopeLabel));
+      }
+    }
+
+    const problems: string[] = [];
+    const verifyFeedback = formatVerifyFeedback(checks);
+    if (verifyFeedback) problems.push(verifyFeedback);
+    problems.push(...this.lintProblems(diff));
 
     let compile = skippedCompileResult(
       this.config,
       `VALIDATION_MODE=${this.config.validationMode} — Unity 컴파일 검수를 건너뛰었습니다.`,
     );
     let tests = skippedTestResult();
+    let judge = skippedJudgeResult('앞 단계 실패 또는 판정 생략');
 
-    if (this.shouldRunUnityCompile()) {
-      await this.notifier.validating(step.id, 'Unity Batchmode 컴파일 검사 중...');
-      compile = await runUnityCompile(this.config);
+    const cheapOk = problems.length === 0;
+    if (cheapOk && this.shouldRunUnityCompile()) {
+      await this.notifier.validating(
+        step.id,
+        this.config.unityValidationBackend === 'batch'
+          ? 'Unity Batchmode 컴파일 검사 중...'
+          : 'Unity Editor(MCP) 컴파일 검사 중...',
+      );
+      compile = await runUnityCompile(this.config, this.runAbort.signal);
 
       if (compile.ok && this.shouldRunTests(step)) {
-        await this.notifier.validating(step.id, 'Unity EditMode 테스트 실행 중...');
-        tests = await runUnityTests(this.config, true);
+        await this.notifier.validating(step.id, 'Unity Editor(MCP) EditMode 테스트 실행 중...');
+        tests = await runUnityTests(this.config, true, this.runAbort.signal);
       }
     }
-
-    const problems: string[] = [...this.lintProblems(diff)];
 
     if (this.shouldRunUnityCompile() && !compile.ok) {
       problems.push(formatCompileFeedback(compile, this.config.maxErrorLines));
@@ -366,17 +485,32 @@ export class Orchestrator {
       problems.push(formatTestFeedback(tests, 10));
     }
 
+    if (problems.length === 0 && this.config.stepJudge && !this.stopRequested) {
+      await this.notifier.validating(step.id, '완료 조건 판정 중...');
+      judge = await runStepJudge({
+        config: this.config,
+        step,
+        delta,
+        checks,
+        signal: this.runAbort.signal,
+      });
+      const judgeFeedback = formatJudgeFeedback(judge);
+      if (judgeFeedback) problems.push(judgeFeedback);
+    }
+
     const ok = problems.length === 0;
     if (ok) {
       const compileLabel = this.shouldRunUnityCompile() ? '컴파일 ok' : '컴파일 생략';
       const testLabel =
         this.shouldRunTests(step) && !tests.skipped ? `테스트 ${tests.passed}/${tests.total}` : '테스트 생략';
+      const checkLabel = `${checks.filter((item) => item.ok).length}/${checks.length}`;
+      const judgeLabel = judge.skipped ? '판정 생략' : '판정 ok';
       log.info(
-        `Step ${step.id} 검수 통과 (린트 ok, ${compileLabel}, ${testLabel}, 변경 ${diff.changedFiles.length}개 파일)`,
+        `Step ${step.id} 검수 통과 (verify ${checkLabel}, 린트 ok, ${compileLabel}, ${testLabel}, ${judgeLabel}, delta ${diff.changedFiles.length}개)`,
       );
     }
 
-    return { ok, skipped: false, compile, tests, diff, feedback: problems.join('\n\n') };
+    return { ok, skipped: false, compile, tests, diff, delta, checks, judge, feedback: problems.join('\n\n') };
   }
 
   private compileSummary(mode: ValidationMode, report: ValidationReport): string {
@@ -387,10 +521,19 @@ export class Orchestrator {
   private async commitStep(
     step: RoadmapStep,
     report: ValidationReport,
+    baseline: WorkingTreeSnapshot,
   ): Promise<{ hash: string | null; failed: boolean; feedback: string }> {
     const noCommit = { hash: null as string | null, failed: false, feedback: '' };
 
-    if (!this.config.autoCommit || !this.gitAvailable || !report.diff.hasChanges) return noCommit;
+    if (!this.config.autoCommit || !this.gitAvailable || !report.delta.hasChanges) return noCommit;
+
+    const selected = selectCommitFiles(baseline, report.delta.changedFiles);
+    if (selected.skippedDirty.length > 0) {
+      log.warn(
+        `시작 당시 dirty 파일이라 커밋에서 제외합니다: ${selected.skippedDirty.slice(0, 8).join(', ')}`,
+      );
+    }
+    if (selected.files.length === 0) return noCommit;
 
     const subject = step.commitMessage ?? `feat: complete Step ${step.id} - ${step.title}`;
     const testSummary = report.tests.skipped
@@ -398,11 +541,15 @@ export class Orchestrator {
       : `${report.tests.passed}/${report.tests.total}`;
     const compileSummary = this.compileSummary(this.config.validationMode, report);
     const lintSummary = report.skipped ? 'skipped' : report.diff.violations.length === 0 ? 'ok' : 'failed';
+    const verifySummary = report.skipped
+      ? 'skipped'
+      : `${report.checks.filter((item) => item.ok).length}/${report.checks.length}`;
+    const judgeSummary = report.skipped || report.judge.skipped ? 'skipped' : report.judge.ok ? 'ok' : 'failed';
     const body = [
       '',
       `Validation: ${this.config.validationMode}`,
-      `Changed files: ${report.diff.changedFiles.length}`,
-      `Lint: ${lintSummary} / Compile: ${compileSummary} / Tests: ${testSummary}`,
+      `Changed files: ${report.delta.changedFiles.length}`,
+      `Verify: ${verifySummary} / Lint: ${lintSummary} / Compile: ${compileSummary} / Tests: ${testSummary} / Judge: ${judgeSummary}`,
       ...(report.skipped
         ? [
             '',
@@ -418,7 +565,7 @@ export class Orchestrator {
       const hash = await commitAll(
         this.config,
         `${subject}\n${body}`,
-        report.diff.changedFiles,
+        selected.files,
       );
       if (hash) return { hash, failed: false, feedback: '' };
 
@@ -454,10 +601,32 @@ export class Orchestrator {
       this.state.completedSteps.push(step.id);
       this.state.completedSteps.sort((a, b) => a - b);
     }
+    delete this.state.attempts[String(step.id)];
     this.state.status = 'completed';
     delete this.state.lastError;
     saveState(this.config, this.state);
   }
+}
+
+/** 완료 Step 은 forceRerun 없이 건너뛴다. --from 은 하한만 바꾼다. */
+export function selectRunnableSteps(
+  roadmap: Roadmap,
+  state: OrchestratorState,
+  options: RunOptions = {},
+): RoadmapStep[] {
+  let steps = roadmap.steps;
+
+  if (options.fromStep !== undefined) {
+    steps = steps.filter((step) => step.id >= options.fromStep!);
+  }
+  if (options.toStep !== undefined) {
+    steps = steps.filter((step) => step.id <= options.toStep!);
+  }
+  if (!options.forceRerun) {
+    steps = steps.filter((step) => !state.completedSteps.includes(step.id));
+  }
+
+  return steps;
 }
 
 /** preview-prompt 용 — state 를 변경하지 않고 Step 목록을 고른다. */
@@ -466,18 +635,7 @@ export function selectPreviewSteps(
   state: OrchestratorState,
   fromStep?: number,
   toStep?: number,
+  forceRerun?: boolean,
 ): RoadmapStep[] {
-  let steps = roadmap.steps;
-
-  if (fromStep !== undefined) {
-    steps = steps.filter((step) => step.id >= fromStep);
-  } else {
-    steps = steps.filter((step) => !state.completedSteps.includes(step.id));
-  }
-
-  if (toStep !== undefined) {
-    steps = steps.filter((step) => step.id <= toStep);
-  }
-
-  return steps;
+  return selectRunnableSteps(roadmap, state, { fromStep, toStep, forceRerun });
 }

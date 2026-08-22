@@ -4,6 +4,9 @@ import path from 'node:path';
 import { collectCursorRules } from './cursorRunner';
 import { createLogger } from './logger';
 import { listMcpServerNames } from './mcpProbe';
+import { inferVerifyChecks, mergeVerifyChecks } from './inferVerify';
+import { formatVerifyForPrompt } from './stepVerifier';
+import { budgetText } from './textBudget';
 import type {
   AgentRunResult,
   OrchestratorConfig,
@@ -18,7 +21,6 @@ const log = createLogger('memory');
 
 const MAX_MEMORIES_IN_CONTEXT = 5;
 const MAX_SUMMARY_LINES = 4;
-const MAX_SPEC_CHARS = 6_000;
 
 export function createInitialState(project: string): OrchestratorState {
   const now = new Date().toISOString();
@@ -31,6 +33,7 @@ export function createInitialState(project: string): OrchestratorState {
     memories: [],
     startedAt: now,
     updatedAt: now,
+    usage: { inputTokens: 0, outputTokens: 0, runs: 0 },
   };
 }
 
@@ -51,11 +54,42 @@ export function saveState(config: OrchestratorConfig, state: OrchestratorState):
   fs.writeFileSync(config.statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
 }
 
+export interface StructuredAgentSummary {
+  summary: string[];
+  files: string[];
+  next: string[];
+}
+
+function captureLabeledLines(text: string, label: string): string[] {
+  const matched: string[] = [];
+  const pattern = new RegExp(`^${label}:\\s*(.+)$`, 'gim');
+  for (const hit of text.matchAll(pattern)) {
+    const value = hit[1]?.trim();
+    if (value) matched.push(value);
+  }
+  return matched;
+}
+
+/** 프롬프트 규약 SUMMARY / FILES / NEXT 를 우선 파싱한다. */
+export function parseStructuredAgentSummary(text: string): StructuredAgentSummary | null {
+  const summary = captureLabeledLines(text, 'SUMMARY');
+  const files = captureLabeledLines(text, 'FILES');
+  const next = captureLabeledLines(text, 'NEXT');
+  if (summary.length === 0 && files.length === 0 && next.length === 0) return null;
+  return { summary, files, next };
+}
+
 /**
  * Agent 출력에서 노이즈를 제거하고 핵심 문장만 추출한다.
- * (다음 Step 의 Fresh Context 에 주입할 압축 메모리)
+ * SUMMARY/FILES/NEXT 가 있으면 그걸 쓰고, 없으면 한/영 키워드 휴리스틱.
  */
 export function summarizeAgentOutput(result: AgentRunResult, maxLines = MAX_SUMMARY_LINES): string[] {
+  const structured = parseStructuredAgentSummary(result.assistantText);
+  if (structured) {
+    const picked = [...structured.summary, ...structured.next].filter(Boolean);
+    if (picked.length > 0) return picked.slice(0, maxLines);
+  }
+
   const lines = result.assistantText
     .split(/\r?\n/)
     .map((line) => line.replace(/^[\s>*\-#]+/, '').trim())
@@ -67,7 +101,9 @@ export function summarizeAgentOutput(result: AgentRunResult, maxLines = MAX_SUMM
 
   const scored = lines.map((line, index) => {
     let score = 0;
-    if (/(구현|추가|생성|수정|삭제|리팩터|연결|설정|완료)/.test(line)) score += 3;
+    if (/(구현|추가|생성|수정|삭제|리팩터|연결|설정|완료|added|created|implemented|fixed|completed)/i.test(line)) {
+      score += 3;
+    }
     if (/\.(cs|asmdef|prefab|unity|asset|json)\b/i.test(line)) score += 2;
     if (/(GameObject|Component|Addressable|UniTask|MVP|Presenter|View|Model)/i.test(line)) score += 2;
     // 결론은 대개 뒤쪽에 위치
@@ -98,7 +134,7 @@ export function buildStepMemory(
     title: step.title,
     status: report?.ok ? 'completed' : 'failed',
     summary: summarizeAgentOutput(result),
-    changedFiles: (report?.diff.changedFiles ?? []).slice(0, 12),
+    changedFiles: structuredChangedFiles(result, report),
     commitHash,
     attempts,
     finishedAt: new Date().toISOString(),
@@ -110,12 +146,22 @@ export function appendMemory(state: OrchestratorState, memory: StepMemory): void
   state.memories.push(memory);
 }
 
+function structuredChangedFiles(result: AgentRunResult, report: ValidationReport | null): string[] {
+  const fromReport = report?.delta.changedFiles ?? report?.diff.changedFiles ?? [];
+  if (fromReport.length > 0) return fromReport.slice(0, 12);
+  const structured = parseStructuredAgentSummary(result.assistantText);
+  if (!structured) return [];
+  return structured.files
+    .flatMap((line) => line.split(/[,;\s]+/))
+    .map((item) => item.trim())
+    .filter((item) => item.includes('/') || /\.\w+$/.test(item))
+    .slice(0, 12);
+}
+
 function readSpec(config: OrchestratorConfig): string {
   if (!fs.existsSync(config.specPath)) return '';
   const content = fs.readFileSync(config.specPath, 'utf8').trim();
-  return content.length > MAX_SPEC_CHARS
-    ? `${content.slice(0, MAX_SPEC_CHARS)}\n\n[...기획서가 길어 일부 생략됨. 전체 내용은 ${config.specPath} 참조...]`
-    : content;
+  return budgetText(content, config.specMaxChars, '기획서');
 }
 
 function renderMemories(state: OrchestratorState): string {
@@ -146,7 +192,9 @@ function buildOutputContract(mode: ValidationMode): string {
   ];
 
   if (mode === 'compile' || mode === 'full') {
-    lines.push('- 오케스트레이터가 Unity Batchmode 로 컴파일 검수를 수행하므로 C# 컴파일 에러가 없어야 한다.');
+    lines.push(
+      '- 오케스트레이터가 열린 Unity Editor(MCP) 로 컴파일 검수를 수행한다. 에디터를 끄지 말고 C# 컴파일 에러가 없어야 한다.',
+    );
   }
   if (mode === 'full') {
     lines.push(
@@ -154,10 +202,12 @@ function buildOutputContract(mode: ValidationMode): string {
     );
   }
   if (mode === 'lint') {
-    lines.push('- 검수는 Git Diff 린트(컨벤션 위반) 위주이지만, C# 코드는 컴파일 가능한 상태로 작성할 것.');
+    lines.push('- 검수는 Verify 체크와 Git Diff 린트(이번 Step 시작 이후 · 대상 경로)다. C# 은 컴파일 가능하게 작성할 것.');
   }
 
   lines.push(
+    '- targetFiles/완료 조건에서 추론한 파일 존재와 로드맵 verify.checks 를 오케스트레이터가 직접 확인한다.',
+    '- 그 다음 별도 판정 Agent 가 완료 조건 충족 여부를 본다. 채팅 설명만으로 완료가 되지 않는다.',
     '- git commit 은 오케스트레이터가 수행하므로 직접 커밋하지 말 것.',
     '- 작업을 마치면 마지막에 다음 형식으로 3줄 이내 요약을 남길 것:',
     '  SUMMARY: <무엇을 구현했는지>',
@@ -185,7 +235,7 @@ export interface BuildPromptArgs {
 export function buildStepPrompt(args: BuildPromptArgs): string {
   const { config, state, step, totalSteps, feedback, attempt } = args;
 
-  const rules = collectCursorRules(config.targetProjectPath);
+  const rules = collectCursorRules(config.targetProjectPath, config.rulesMaxChars);
   const mcpServers = listMcpServerNames(config.targetProjectPath);
   const spec = readSpec(config);
 
@@ -240,6 +290,12 @@ export function buildStepPrompt(args: BuildPromptArgs): string {
       '## 완료 조건 (Acceptance Criteria)',
       ...step.acceptanceCriteria.map((item) => `- ${item}`),
     );
+  }
+
+  const inferred = config.inferVerify ? inferVerifyChecks(step) : [];
+  const verifyPrompt = formatVerifyForPrompt(mergeVerifyChecks(inferred, step.verify?.checks ?? []));
+  if (verifyPrompt) {
+    taskLines.push('', verifyPrompt);
   }
 
   sections.push(taskLines.join('\n'));

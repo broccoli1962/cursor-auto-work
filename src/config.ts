@@ -5,7 +5,14 @@ import path from 'node:path';
 import dotenv from 'dotenv';
 
 import { createLogger } from './logger';
-import type { LogLevel, OrchestratorConfig, PromptDelivery, ValidationMode } from './types';
+import { findUnityMcpEntry } from './mcpProbe';
+import type {
+  LogLevel,
+  OrchestratorConfig,
+  PromptDelivery,
+  UnityValidationBackend,
+  ValidationMode,
+} from './types';
 
 dotenv.config();
 
@@ -54,8 +61,8 @@ function parseValidationMode(raw: string): ValidationMode {
   if (normalized === 'lint' || normalized === 'compile' || normalized === 'full' || normalized === 'skip') {
     return normalized;
   }
-  log.warn(`알 수 없는 VALIDATION_MODE='${raw}' — lint 로 대체합니다.`);
-  return 'lint';
+  log.warn(`알 수 없는 VALIDATION_MODE='${raw}' — compile 로 대체합니다.`);
+  return 'compile';
 }
 
 export class ConfigError extends Error {}
@@ -68,16 +75,24 @@ export function needsGitValidation(config: OrchestratorConfig): boolean {
   return config.validationMode !== 'skip';
 }
 
+function judgeSuffix(config: OrchestratorConfig): string {
+  return config.stepJudge ? ' → 완료 조건 판정' : '';
+}
+
 export function describeValidationMode(config: OrchestratorConfig): string {
   switch (config.validationMode) {
     case 'skip':
       return '건너뜀 (커밋 본문에만 기록)';
     case 'lint':
-      return 'Git Diff 린트';
+      return '추론/명시 Verify + delta 린트' + judgeSuffix(config);
     case 'compile':
-      return 'Git Diff 린트 → Unity 컴파일';
+      return config.unityValidationBackend === 'batch'
+        ? 'Verify + 린트 → 배치모드 컴파일' + judgeSuffix(config)
+        : 'Verify + 린트 → Editor 컴파일' + judgeSuffix(config);
     case 'full':
-      return 'Git Diff 린트 → Unity 컴파일 → EditMode 테스트 (step.runTests=true)';
+      return config.unityValidationBackend === 'batch'
+        ? 'Verify + 린트 → 배치모드 컴파일 → 테스트' + judgeSuffix(config)
+        : 'Verify + 린트 → Editor 컴파일 → 테스트' + judgeSuffix(config);
     default:
       return config.validationMode;
   }
@@ -117,16 +132,25 @@ export function loadConfig(overrides: Partial<OrchestratorConfig> = {}): Orchest
     : 'auto';
 
   const validationMode =
-    overrides.validationMode ?? parseValidationMode(str('VALIDATION_MODE', 'lint'));
+    overrides.validationMode ?? parseValidationMode(str('VALIDATION_MODE', 'compile'));
+
+  const backendRaw = str('UNITY_VALIDATION_BACKEND', 'mcp').toLowerCase();
+  const unityValidationBackend: UnityValidationBackend =
+    overrides.unityValidationBackend ?? (backendRaw === 'batch' ? 'batch' : 'mcp');
 
   const config: OrchestratorConfig = {
     targetProjectPath,
     unityPath: overrides.unityPath ?? str('UNITY_PATH'),
     cursorAgentBin: overrides.cursorAgentBin ?? str('CURSOR_AGENT_BIN', 'agent'),
     cursorModel: overrides.cursorModel ?? str('CURSOR_MODEL'),
-    cursorYolo: overrides.cursorYolo ?? bool('CURSOR_YOLO', false),
+    cursorYolo: overrides.cursorYolo ?? bool('CURSOR_YOLO', true),
     promptDelivery: overrides.promptDelivery ?? promptDelivery,
     validationMode,
+    unityValidationBackend,
+    unityLaunchEditor: overrides.unityLaunchEditor ?? bool('UNITY_LAUNCH_EDITOR', true),
+    unityLaunchTimeoutMs: overrides.unityLaunchTimeoutMs ?? num('UNITY_LAUNCH_TIMEOUT_MS', 3 * 60 * 1000),
+    unityStopPlayMode: overrides.unityStopPlayMode ?? bool('UNITY_STOP_PLAY_MODE', true),
+    unityRestorePlayMode: overrides.unityRestorePlayMode ?? bool('UNITY_RESTORE_PLAY_MODE', true),
 
     discordWebhookUrl: overrides.discordWebhookUrl ?? str('DISCORD_WEBHOOK_URL'),
 
@@ -145,6 +169,14 @@ export function loadConfig(overrides: Partial<OrchestratorConfig> = {}): Orchest
     maxRetries: overrides.maxRetries ?? num('MAX_RETRIES', 3),
     agentTimeoutMs: overrides.agentTimeoutMs ?? num('AGENT_TIMEOUT_MS', 30 * 60 * 1000),
     unityTimeoutMs: overrides.unityTimeoutMs ?? num('UNITY_TIMEOUT_MS', 20 * 60 * 1000),
+    inferVerify: overrides.inferVerify ?? bool('INFER_VERIFY', true),
+    stepJudge: overrides.stepJudge ?? bool('STEP_JUDGE', true),
+    judgeTimeoutMs: overrides.judgeTimeoutMs ?? num('JUDGE_TIMEOUT_MS', 3 * 60 * 1000),
+    resumeOnRetry: overrides.resumeOnRetry ?? bool('RESUME_ON_RETRY', true),
+    rollbackOnFail: overrides.rollbackOnFail ?? bool('ROLLBACK_ON_FAIL', true),
+    createWorkBranch: overrides.createWorkBranch ?? bool('CREATE_WORK_BRANCH', true),
+    rulesMaxChars: overrides.rulesMaxChars ?? num('RULES_MAX_CHARS', 40_000),
+    specMaxChars: overrides.specMaxChars ?? num('SPEC_MAX_CHARS', 20_000),
     autoCommit: overrides.autoCommit ?? bool('AUTO_COMMIT', false),
     gitAuthorName: overrides.gitAuthorName ?? str('GIT_AUTHOR_NAME'),
     gitAuthorEmail: overrides.gitAuthorEmail ?? str('GIT_AUTHOR_EMAIL'),
@@ -195,12 +227,13 @@ export function validateConfig(config: OrchestratorConfig): ValidationIssue[] {
     });
   }
 
-  const needsUnityPath = needsUnity(config) && config.validationMode !== 'skip';
+  const needsUnityPath =
+    needsUnity(config) && config.unityValidationBackend === 'batch';
   if (!config.unityPath) {
     if (needsUnityPath) {
       issues.push({
         fatal: true,
-        message: `VALIDATION_MODE=${config.validationMode} 에는 UNITY_PATH 가 필요합니다.`,
+        message: `UNITY_VALIDATION_BACKEND=batch 에는 UNITY_PATH 가 필요합니다.`,
       });
     }
   } else if (!fs.existsSync(config.unityPath)) {
@@ -208,6 +241,16 @@ export function validateConfig(config: OrchestratorConfig): ValidationIssue[] {
       fatal: needsUnityPath,
       message: `UNITY_PATH 실행 파일을 찾을 수 없습니다: ${config.unityPath}`,
     });
+  }
+
+  if (needsUnity(config) && config.unityValidationBackend === 'mcp') {
+    if (!findUnityMcpEntry(config.targetProjectPath)) {
+      issues.push({
+        fatal: true,
+        message:
+          'VALIDATION_MODE=compile/full 은 열린 Unity Editor + UnityMCP 로 검수합니다. mcp.json 에 UnityMCP 를 등록하고 에디터를 실행해 두세요. (구 배치모드는 UNITY_VALIDATION_BACKEND=batch)',
+      });
+    }
   }
 
   if (!fs.existsSync(config.roadmapPath)) {

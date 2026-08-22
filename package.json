@@ -13,7 +13,8 @@
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "run:orchestrator": "node dist/index.js run",
-    "clean": "rimraf dist"
+    "clean": "rimraf dist",
+    "test": "tsx --test src/cliArgs.test.ts src/runLock.test.ts src/gitManager.test.ts src/memoryManager.test.ts src/stepVerifier.test.ts src/selectSteps.test.ts src/roadmap.test.ts src/unityMcpParse.test.ts src/processKill.test.ts src/inferVerify.test.ts src/unityAssetInspect.test.ts"
   },
   "engines": {
     "node": ">=18"

@@ -8,6 +8,8 @@ import axios from 'axios';
 
 import { decodeConsole } from './encoding';
 import { createLogger } from './logger';
+import { ABORT_MESSAGE, killChildTree, throwIfAborted } from './processKill';
+import { toolNamesFromList } from './unityTools';
 
 const log = createLogger('mcp');
 
@@ -49,6 +51,7 @@ export interface McpProbeResult {
   /** 서버가 보고한 이름/버전 */
   serverInfo?: string;
   toolCount?: number;
+  toolNames?: string[];
   durationMs: number;
   error?: string;
   /** UnityMCP 에 붙어 있는 Editor 인스턴스 (예: AutoRpg@30a4666de7d51ef1) */
@@ -103,7 +106,7 @@ export function listMcpServerNames(projectRoot: string): string[] {
     .map((entry) => entry.name);
 }
 
-interface RpcSession {
+export interface McpRpcSession {
   request(method: string, params?: unknown): Promise<unknown>;
   notify(method: string, params?: unknown): Promise<void>;
   close(): Promise<void>;
@@ -143,7 +146,7 @@ function extractRpcPayloads(raw: string): Record<string, unknown>[] {
   return payloads;
 }
 
-class HttpRpcSession implements RpcSession {
+class HttpRpcSession implements McpRpcSession {
   private sessionId = '';
 
   private nextId = 1;
@@ -152,11 +155,14 @@ class HttpRpcSession implements RpcSession {
     private readonly url: string,
     private readonly headers: Record<string, string>,
     private readonly timeoutMs: number,
+    private readonly signal?: AbortSignal,
   ) {}
 
   private async post(body: unknown): Promise<{ status: number; raw: string }> {
+    throwIfAborted(this.signal, ABORT_MESSAGE);
     const response = await axios.post(this.url, JSON.stringify(body), {
       timeout: this.timeoutMs,
+      signal: this.signal,
       responseType: 'text',
       transformResponse: [(data: unknown) => data],
       validateStatus: () => true,
@@ -201,6 +207,7 @@ class HttpRpcSession implements RpcSession {
         timeout: 3000,
         validateStatus: () => true,
         headers: { 'Mcp-Session-Id': this.sessionId },
+        signal: this.signal,
       });
     } catch {
       // 세션 정리는 실패해도 점검 결과에 영향을 주지 않는다
@@ -208,7 +215,7 @@ class HttpRpcSession implements RpcSession {
   }
 }
 
-class StdioRpcSession implements RpcSession {
+class StdioRpcSession implements McpRpcSession {
   private readonly child: ChildProcessWithoutNullStreams;
 
   private readonly pending = new Map<
@@ -230,6 +237,7 @@ class StdioRpcSession implements RpcSession {
     def: McpServerDef,
     cwd: string,
     private readonly timeoutMs: number,
+    private readonly signal?: AbortSignal,
   ) {
     if (!def.command) throw new Error('command 가 정의되어 있지 않습니다');
 
@@ -254,7 +262,15 @@ class StdioRpcSession implements RpcSession {
 
     this.child.on('error', (error) => this.fail(`프로세스 실행 실패: ${error.message}`));
     this.child.on('close', (code) => this.fail(`프로세스가 코드 ${code} 로 종료됨${this.stderrTail()}`));
+
+    this.signal?.addEventListener('abort', this.onAbort, { once: true });
+    if (this.signal?.aborted) this.onAbort();
   }
+
+  private readonly onAbort = (): void => {
+    this.fail(ABORT_MESSAGE);
+    killChildTree(this.child);
+  };
 
   private stderrTail(): string {
     if (this.stderrChunks.length === 0) return '';
@@ -342,6 +358,7 @@ class StdioRpcSession implements RpcSession {
   }
 
   async close(): Promise<void> {
+    this.signal?.removeEventListener('abort', this.onAbort);
     this.pending.clear();
     this.child.removeAllListeners('close');
     if (this.child.exitCode !== null) return;
@@ -349,7 +366,7 @@ class StdioRpcSession implements RpcSession {
     this.child.stdin.end();
     await new Promise<void>((resolve) => {
       const timer = setTimeout(() => {
-        this.child.kill();
+        killChildTree(this.child);
         resolve();
       }, 1000);
       this.child.once('exit', () => {
@@ -366,7 +383,38 @@ function isUnityServer(entry: McpServerEntry, serverName: string): boolean {
 }
 
 /** UnityMCP 는 서버가 살아 있어도 Editor 가 안 붙어 있으면 도구 호출이 실패한다. 인스턴스까지 확인한다. */
-async function readUnityInstances(session: RpcSession): Promise<string[]> {
+export function findUnityMcpEntry(projectRoot: string): McpServerEntry | undefined {
+  return loadMcpServers(projectRoot).find((entry) => !entry.def.disabled && isUnityServer(entry, ''));
+}
+
+export async function openMcpSession(
+  entry: McpServerEntry,
+  timeoutMs: number,
+  projectRoot: string,
+  clientName = CLIENT_INFO.name,
+  signal?: AbortSignal,
+): Promise<{ session: McpRpcSession; serverInfo?: string }> {
+  throwIfAborted(signal, ABORT_MESSAGE);
+  const session: McpRpcSession =
+    entry.transport === 'http'
+      ? new HttpRpcSession(entry.def.url ?? '', entry.def.headers ?? {}, timeoutMs, signal)
+      : new StdioRpcSession(entry.def, projectRoot, timeoutMs, signal);
+
+  const init = (await session.request('initialize', {
+    protocolVersion: PROTOCOL_VERSION,
+    capabilities: {},
+    clientInfo: { name: clientName, version: CLIENT_INFO.version },
+  })) as { serverInfo?: { name?: string; version?: string } };
+  await session.notify('notifications/initialized');
+
+  const serverName = init?.serverInfo?.name ?? '';
+  return {
+    session,
+    serverInfo: serverName ? `${serverName} ${init?.serverInfo?.version ?? ''}`.trim() : undefined,
+  };
+}
+
+export async function readUnityInstances(session: McpRpcSession): Promise<string[]> {
   const response = (await session.request('resources/read', { uri: UNITY_INSTANCES_URI })) as {
     contents?: { text?: string }[];
   };
@@ -394,34 +442,24 @@ export async function probeMcpServer(
     return { ...base, ok: false, skipped: true, durationMs: 0, error: '설정에서 비활성화됨' };
   }
 
-  let session: RpcSession | null = null;
+  let session: McpRpcSession | null = null;
   try {
-    session =
-      entry.transport === 'http'
-        ? new HttpRpcSession(entry.def.url ?? '', entry.def.headers ?? {}, timeoutMs)
-        : new StdioRpcSession(entry.def, projectRoot, timeoutMs);
+    const opened = await openMcpSession(entry, timeoutMs, projectRoot);
+    session = opened.session;
+    const listed = await session.request('tools/list');
+    const toolNames = toolNamesFromList(listed);
 
-    const init = (await session.request('initialize', {
-      protocolVersion: PROTOCOL_VERSION,
-      capabilities: {},
-      clientInfo: CLIENT_INFO,
-    })) as { serverInfo?: { name?: string; version?: string } };
-
-    await session.notify('notifications/initialized');
-
-    const listed = (await session.request('tools/list')) as { tools?: unknown[] };
-
-    const serverName = init?.serverInfo?.name ?? '';
     const result: McpProbeResult = {
       ...base,
       ok: true,
       skipped: false,
-      serverInfo: serverName ? `${serverName} ${init?.serverInfo?.version ?? ''}`.trim() : undefined,
-      toolCount: Array.isArray(listed?.tools) ? listed.tools.length : 0,
+      serverInfo: opened.serverInfo,
+      toolCount: toolNames.length,
+      toolNames,
       durationMs: Date.now() - startedAt,
     };
 
-    if (isUnityServer(entry, serverName)) {
+    if (isUnityServer(entry, opened.serverInfo ?? '')) {
       try {
         const instances = await readUnityInstances(session);
         result.unityInstances = instances;

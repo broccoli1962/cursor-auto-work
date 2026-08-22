@@ -1,6 +1,6 @@
 {
   "project": "Sample Roguelike",
-  "description": "docs/spec.md 기반 단계별 자동화 로드맵 (샘플). 실제 사용 시 대상 Unity 프로젝트의 docs/roadmap.json 을 작성하세요.",
+  "description": "docs/spec.md 기반 단계별 자동화 로드맵 (샘플). 검수는 targetFiles 와 acceptanceCriteria 에서 추론한다. 실제 사용 시 대상 Unity 프로젝트의 docs/roadmap.json 을 작성하세요.",
   "steps": [
     {
       "id": 1,

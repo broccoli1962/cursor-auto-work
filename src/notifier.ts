@@ -133,15 +133,29 @@ export class Notifier {
     });
   }
 
-  pipelineDone(project: string, completed: number, total: number, durationMs: number): Promise<void> {
+  pipelineDone(
+    project: string,
+    completed: number,
+    total: number,
+    durationMs: number,
+    usage?: { inputTokens: number; outputTokens: number; runs: number },
+  ): Promise<void> {
+    const fields = [
+      { name: '완료 Step', value: `${completed}/${total}`, inline: true },
+      { name: '총 소요 시간', value: `${Math.round(durationMs / 60_000)}분`, inline: true },
+    ];
+    if (usage && usage.runs > 0) {
+      fields.push({
+        name: '토큰',
+        value: `in ${usage.inputTokens} / out ${usage.outputTokens} (${usage.runs}회)`,
+        inline: true,
+      });
+    }
     return this.send({
       level: 'success',
       title: '전체 파이프라인 완료',
       description: `${project} 프로젝트의 모든 Step 이 완료되었습니다.`,
-      fields: [
-        { name: '완료 Step', value: `${completed}/${total}`, inline: true },
-        { name: '총 소요 시간', value: `${Math.round(durationMs / 60_000)}분`, inline: true },
-      ],
+      fields,
     });
   }
 }
