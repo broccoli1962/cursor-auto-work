@@ -46,6 +46,8 @@ function stubConfig(): OrchestratorConfig {
     rulesMaxChars: 4_000,
     specMaxChars: 4_000,
     autoCommit: false,
+    autoPush: false,
+    commitLanguage: 'ko',
     gitAuthorName: '',
     gitAuthorEmail: '',
     maxErrorLines: 20,

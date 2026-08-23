@@ -62,6 +62,7 @@ Options:
   --retries <n>          MAX_RETRIES 덮어쓰기
   --validation <mode>    lint | compile | full | skip (VALIDATION_MODE 덮어쓰기)
   --no-commit            자동 커밋 비활성화
+  --no-push              자동 푸시 비활성화
   --debug                로그 레벨을 debug 로 설정
   --no-mcp-probe         MCP 서버 실제 접속 점검을 생략 (doctor, run)
   --mcp-timeout <ms>     MCP 응답 대기 시간 (기본 20000)
@@ -97,6 +98,7 @@ function buildConfig(flags: ParsedArgs['flags']): OrchestratorConfig {
   const validationMode = parseValidationFlag(flags);
   if (validationMode !== undefined) overrides.validationMode = validationMode;
   if (flags['no-commit'] === true) overrides.autoCommit = false;
+  if (flags['no-push'] === true) overrides.autoPush = false;
   if (flags['no-infer-verify'] === true) overrides.inferVerify = false;
   if (flags['no-judge'] === true) overrides.stepJudge = false;
   if (flags['no-launch-editor'] === true) overrides.unityLaunchEditor = false;
@@ -320,6 +322,8 @@ async function commandDoctor(
     `Unity 검수 채널 : ${config.unityValidationBackend === 'batch' ? 'batch (에디터 종료)' : 'mcp (열린 에디터)'}`,
     `에디터 자동 기동 : ${config.unityLaunchEditor ? '활성' : '비활성'}`,
     `자동 커밋       : ${config.autoCommit ? '활성' : '비활성'}`,
+    `자동 푸시       : ${config.autoPush ? '활성 (force 없음)' : '비활성'}`,
+    `커밋 언어       : ${config.commitLanguage}`,
     `재시도 resume   : ${config.resumeOnRetry ? '활성' : '비활성'}`,
     `실패 롤백       : ${config.rollbackOnFail ? '활성' : '비활성'}`,
     `verify 추론     : ${config.inferVerify ? '활성 (로드맵을 고치지 않음)' : '비활성'}`,

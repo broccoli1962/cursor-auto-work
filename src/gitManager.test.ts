@@ -6,8 +6,11 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
+  collectUnifiedDiff,
   diffSinceSnapshot,
   ensureUnityGitignore,
+  hasMeaningfulEdits,
+  lintChangedFiles,
   missingGitignorePatterns,
   restoreFilesSinceSnapshot,
   selectCommitFiles,
@@ -51,6 +54,8 @@ function stub(dir: string): OrchestratorConfig {
     rulesMaxChars: 1000,
     specMaxChars: 1000,
     autoCommit: false,
+    autoPush: false,
+    commitLanguage: 'ko',
     gitAuthorName: 't',
     gitAuthorEmail: 't@t',
     maxErrorLines: 10,
@@ -118,5 +123,31 @@ describe('snapshot + commit filter + rollback', () => {
     assert.ok(restored.includes('fresh.txt'));
     assert.equal(fs.existsSync(path.join(dir, 'fresh.txt')), false);
     assert.equal(fs.readFileSync(path.join(dir, 'dirty.txt'), 'utf8'), 'user+agent\n');
+  });
+});
+
+describe('streaming git stdout', () => {
+  it('scans a multi-megabyte diff fully without maxBuffer crash', async () => {
+    const dir = tempRepo();
+    const config = stub(dir);
+    const line = `${'x'.repeat(80)}\n`;
+    fs.writeFileSync(path.join(dir, 'tracked.txt'), `${line.repeat(40_000)}Debug.Log("hi");\n`);
+
+    const lint = await lintChangedFiles(config, ['tracked.txt']);
+    assert.ok(lint.insertions > 0);
+    assert.ok(lint.violations.some((item) => item.includes('Debug.Log')));
+    assert.equal(await hasMeaningfulEdits(config, ['tracked.txt']), true);
+
+    const unified = await collectUnifiedDiff(config, ['tracked.txt']);
+    assert.ok(unified.length > 0);
+    assert.ok(unified.length <= 20_200);
+    assert.match(unified, /diff truncated|Debug\.Log|xxxx/);
+  });
+
+  it('does not treat a comment-only large change as meaningful', async () => {
+    const dir = tempRepo();
+    const config = stub(dir);
+    fs.writeFileSync(path.join(dir, 'tracked.txt'), `hello\n${'// only comment\n'.repeat(40_000)}`);
+    assert.equal(await hasMeaningfulEdits(config, ['tracked.txt']), false);
   });
 });

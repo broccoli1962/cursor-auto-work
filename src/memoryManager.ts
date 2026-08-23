@@ -158,7 +158,7 @@ function structuredChangedFiles(result: AgentRunResult, report: ValidationReport
     .slice(0, 12);
 }
 
-function readSpec(config: OrchestratorConfig): string {
+export function readSpec(config: OrchestratorConfig): string {
   if (!fs.existsSync(config.specPath)) return '';
   const content = fs.readFileSync(config.specPath, 'utf8').trim();
   return budgetText(content, config.specMaxChars, '기획서');
@@ -288,6 +288,8 @@ export function buildStepPrompt(args: BuildPromptArgs): string {
     taskLines.push(
       '',
       '## 완료 조건 (Acceptance Criteria)',
+      '완료 조건은 위 기획서를 기준으로 해석한다. 조건 문장이 짧거나 이상하면 기획서 해당 절을 따른다.',
+      '로드맵과 기획서가 충돌하면 기획서를 우선한다.',
       ...step.acceptanceCriteria.map((item) => `- ${item}`),
     );
   }

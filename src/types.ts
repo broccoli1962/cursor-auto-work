@@ -3,6 +3,7 @@
  */
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+export type CommitLanguage = 'ko' | 'en';
 
 /**
  * 검수 파이프라인 프리셋.
@@ -79,6 +80,10 @@ export interface OrchestratorConfig {
   /** 기획서 예산 (초과 시 중간 생략 + 경고) */
   specMaxChars: number;
   autoCommit: boolean;
+  /** 커밋 성공 후 `git push -u origin HEAD` (force 없음) */
+  autoPush: boolean;
+  /** 커밋 메시지 언어. `{영역} - {변경}` 형식은 고정 */
+  commitLanguage: CommitLanguage;
   gitAuthorName: string;
   gitAuthorEmail: string;
   maxErrorLines: number;

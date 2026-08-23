@@ -2,6 +2,7 @@ import { needsUnity, describeValidationMode } from './config';
 import {
   collectDiff,
   commitAll,
+  pushCurrentBranch,
   diffSinceSnapshot,
   ensureGitRepo,
   ensureUnityGitignore,
@@ -30,6 +31,7 @@ import {
   saveState,
 } from './memoryManager';
 import { Notifier } from './notifier';
+import { clusterCommitFiles, filterSecretCommitFiles } from './projectCommit';
 import { loadRoadmap } from './roadmap';
 import {
   formatVerifyFeedback,
@@ -535,47 +537,47 @@ export class Orchestrator {
     }
     if (selected.files.length === 0) return noCommit;
 
-    const subject = step.commitMessage ?? `feat: complete Step ${step.id} - ${step.title}`;
-    const testSummary = report.tests.skipped
-      ? 'skipped'
-      : `${report.tests.passed}/${report.tests.total}`;
-    const compileSummary = this.compileSummary(this.config.validationMode, report);
-    const lintSummary = report.skipped ? 'skipped' : report.diff.violations.length === 0 ? 'ok' : 'failed';
-    const verifySummary = report.skipped
-      ? 'skipped'
-      : `${report.checks.filter((item) => item.ok).length}/${report.checks.length}`;
-    const judgeSummary = report.skipped || report.judge.skipped ? 'skipped' : report.judge.ok ? 'ok' : 'failed';
-    const body = [
-      '',
-      `Validation: ${this.config.validationMode}`,
-      `Changed files: ${report.delta.changedFiles.length}`,
-      `Verify: ${verifySummary} / Lint: ${lintSummary} / Compile: ${compileSummary} / Tests: ${testSummary} / Judge: ${judgeSummary}`,
-      ...(report.skipped
-        ? [
-            '',
-            'NOTE: validation skipped (VALIDATION_MODE=skip).',
-            'No lint, compile, or test checks were performed.',
-          ]
-        : []),
-      '',
-      'Automated by cursor-auto-work orchestrator.',
-    ].join('\n');
+    const secrets = filterSecretCommitFiles(selected.files);
+    if (secrets.skippedSecrets.length > 0) {
+      log.warn(`시크릿이라 커밋에서 제외합니다: ${secrets.skippedSecrets.join(', ')}`);
+    }
+    if (secrets.files.length === 0) return noCommit;
+
+    const clusters = clusterCommitFiles(secrets.files, step, this.config.commitLanguage);
 
     try {
-      const hash = await commitAll(
-        this.config,
-        `${subject}\n${body}`,
-        selected.files,
-      );
-      if (hash) return { hash, failed: false, feedback: '' };
+      const hashes: string[] = [];
+      for (const cluster of clusters) {
+        const hash = await commitAll(this.config, cluster.subject, cluster.files);
+        if (!hash) {
+          return {
+            hash: hashes[0] ?? null,
+            failed: true,
+            feedback:
+              'Git 커밋에 실패했습니다. 커밋할 변경사항이 없거나 git add/commit 이 거부되었습니다. ' +
+              '워킹 트리 상태와 git 설정을 확인하세요.',
+          };
+        }
+        hashes.push(hash);
+      }
 
-      return {
-        hash: null,
-        failed: true,
-        feedback:
-          'Git 커밋에 실패했습니다. 커밋할 변경사항이 없거나 git add/commit 이 거부되었습니다. ' +
-          '워킹 트리 상태와 git 설정을 확인하세요.',
-      };
+      let pushNote = '';
+      if (this.config.autoPush) {
+        try {
+          pushNote = await pushCurrentBranch(this.config);
+        } catch (error) {
+          const message = (error as Error).message;
+          log.error(`푸시 실패: ${message}`);
+          return {
+            hash: hashes.join(', '),
+            failed: true,
+            feedback: `Git 푸시 실패:\n${message}`,
+          };
+        }
+      }
+
+      if (pushNote) log.info(`Step ${step.id} 커밋+푸시: ${hashes.join(', ')} (${pushNote})`);
+      return { hash: hashes.join(', '), failed: false, feedback: '' };
     } catch (error) {
       const message = (error as Error).message;
       log.error(`커밋 실패: ${message}`);

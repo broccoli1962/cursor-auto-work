@@ -4,6 +4,7 @@ import path from 'node:path';
 import { runCursorAgent } from './cursorRunner';
 import { collectUnifiedDiff } from './gitManager';
 import { judgeCriteriaTexts } from './inferVerify';
+import { readSpec } from './memoryManager';
 import { createLogger } from './logger';
 import { ABORT_MESSAGE } from './processKill';
 import type {
@@ -76,8 +77,17 @@ export function parseJudgeVerdict(text: string): ParsedJudge | null {
   return null;
 }
 
+const EVIDENCE_REL = /(?:Assets|server|Packages|Docs|docs)\/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+/i;
+
+/** `server/src/Program.cs:17` 처럼 줄 번호가 붙어 있어도 상대 경로만 꺼낸다. */
+export function extractEvidenceRelPath(evidence: string): string | null {
+  const stripped = evidence.trim().replace(/\\/g, '/').replace(/:\d+(?::\d+)?\s*$/, '');
+  const match = stripped.match(EVIDENCE_REL);
+  return match?.[0]?.replace(/\\/g, '/') ?? null;
+}
+
 function looksLikePathEvidence(evidence: string): boolean {
-  return /Assets\/|\.cs\b|\.asmdef\b|\.prefab\b|\.json\b|\.uxml\b/.test(evidence);
+  return extractEvidenceRelPath(evidence) !== null;
 }
 
 function compileCriterion(text: string): boolean {
@@ -86,9 +96,13 @@ function compileCriterion(text: string): boolean {
 
 function evidenceFileExists(projectRoot: string | undefined, evidence: string): boolean {
   if (!projectRoot) return true;
-  const match = evidence.match(/Assets\/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+/);
-  if (!match?.[0]) return false;
-  return fs.existsSync(path.join(projectRoot, match[0].replace(/\//g, path.sep)));
+  const rel = extractEvidenceRelPath(evidence);
+  if (!rel) return false;
+  const root = path.resolve(projectRoot);
+  const absolute = path.resolve(root, rel.replace(/\//g, path.sep));
+  const inside = path.relative(root, absolute);
+  if (inside.startsWith('..') || path.isAbsolute(inside)) return false;
+  return fs.existsSync(absolute);
 }
 
 export function finalizeJudgeVerdict(
@@ -198,6 +212,7 @@ export function buildJudgePrompt(args: {
   checks: CheckResult[];
   projectRoot: string;
   unifiedDiff?: string;
+  spec?: string;
 }): string {
   const expected = judgeCriteriaTexts(args.step);
   const criteria = expected.map((item, index) => `${index + 1}. ${item}`).join('\n');
@@ -218,9 +233,11 @@ export function buildJudgePrompt(args: {
   return [
     '너는 구현을 하지 않는 검수자다. 파일을 읽기만 하고 쓰거나 고치거나 Unity/MCP 를 호출하지 마라.',
     '완료 조건을 **하나씩** 평가하라. 한 조건이라도 근거가 없으면 전체 실패다.',
+    '규칙·수치·프로토콜의 정본은 기획서다. 조건 문장이 짧거나 이상하면 기획서 해당 절을 따른다.',
+    '로드맵과 기획서가 충돌하면 기획서를 우선한다. 기획서에 없는 추측은 실패다.',
     '컴파일 성공, 파일 존재, "잘 작성됨" 만으로는 통과가 아니다.',
     '주석·이름만 바꾼 변경, 다른 파일만 수정, 스텁/빈 메서드, 추측성 런타임 성공은 실패다.',
-    'evidence 에는 실제 파일 경로를 넣어라. 경로가 없으면 그 조건은 실패다.',
+    'evidence 에는 실제 구현 파일 경로를 넣어라. 기획서 경로만으로는 통과가 아니다.',
     '컴파일 0건 조건만 기계 체크 통과를 evidence 로 쓸 수 있다.',
     '',
     `Step ${args.step.id}: ${args.step.title}`,
@@ -230,6 +247,9 @@ export function buildJudgePrompt(args: {
     '',
     '## 완료 조건 (이 순서·개수 그대로 평가)',
     criteria,
+    '',
+    '## 기획서 (판정 정본)',
+    args.spec?.trim() || '(기획서 없음 — 완료 조건과 코드만으로 판정)',
     '',
     '## 이미 통과한 기계 체크',
     checkLines,
@@ -284,6 +304,7 @@ export async function runStepJudge(args: {
     checks: args.checks,
     projectRoot: args.config.targetProjectPath,
     unifiedDiff,
+    spec: readSpec(args.config),
   });
 
   log.info(`Step ${args.step.id} 완료 조건 판정 시작 (${expected.length}개 조건)`);

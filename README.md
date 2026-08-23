@@ -5,7 +5,7 @@
 > **이 프로젝트는 실험용 테스트 버전입니다. 프로덕션 환경에서 사용하지 마세요.**
 >
 > - 실제 운영 중인 프로젝트나 백업이 없는 코드베이스를 대상으로 실행하지 마세요.
-> - 기본값은 `CURSOR_YOLO=true`, `AUTO_COMMIT=false`, `VALIDATION_MODE=compile` 입니다. `compile` 은 열린 Unity Editor + UnityMCP 가 필요합니다. 자동 커밋은 `.env` 에서 **명시적으로** 켜야 합니다. YOLO 를 끄려면 `CURSOR_YOLO=false`.
+> - 기본값은 `CURSOR_YOLO=true`, `AUTO_COMMIT=false`, `AUTO_PUSH=false`, `VALIDATION_MODE=compile` 입니다. `compile` 은 열린 Unity Editor + UnityMCP 가 필요합니다. 자동 커밋/푸시는 `.env` 에서 **명시적으로** 켜야 합니다. YOLO 를 끄려면 `CURSOR_YOLO=false`.
 > - 검수 파이프라인(컴파일/테스트/Diff)은 아직 충분히 검증되지 않았고, 잘못된 변경을 통과시킬 수 있습니다.
 > - CLI 옵션, 환경 변수, `roadmap.json` 스키마는 예고 없이 변경될 수 있습니다.
 > - 반드시 **Git으로 관리되는 사본**에서 실행하세요. 기본으로 `auto-work/<시각>` 작업 브랜치를 만듭니다 (`CREATE_WORK_BRANCH`).
@@ -26,7 +26,7 @@ Agent가 끝나면 **추론 Verify → delta 린트 → (compile/full) Editor �
        │                                                                   ▼
        │  ① 추론 Verify  ② delta 린트  ③ Editor 컴파일  ④ 테스트  ⑤ 판정  ◀─┘
        │
-       ├─ 통과 → (선택) git commit → 다음 Step (새 세션)
+       ├─ 통과 → (선택) `{영역} - {변경}` 커밋 → (선택) push → 다음 Step (새 세션)
        └─ 실패 → 피드백 + 세션 resume (최대 N회) → 초과 시 롤백 + Discord 🚨
 ```
 
@@ -91,7 +91,7 @@ UNITY_PATH=C:\Program Files\Unity\Hub\Editor\2022.3.40f1\Editor\Unity.exe
 | `UNITY_RESTORE_PLAY_MODE` | `true` | 검수 후 원래 Play Mode 복구 |
 | `CURSOR_AGENT_BIN` | `agent` | Cursor CLI 실행 명령 |
 | `CURSOR_MODEL` | (CLI 기본값) | 메인 Agent가 사용할 모델 |
-| `CURSOR_YOLO` | `true` | `--force` 를 붙여 MCP 도구 호출/파일 쓰기를 자동 승인. 끄려면 `false` |
+| `CURSOR_YOLO` | `true` | 구현 Agent에 `--force` 를 붙여 MCP/파일 쓰기를 자동 승인. `--trust` 는 YOLO와 관계없이 항상 붙음. 끄려면 `false` |
 | `CURSOR_PROMPT_DELIVERY` | `auto` | 프롬프트 전달 방식: `auto` / `argv` / `stdin` / `file` ([4-4](#4-4-프롬프트-전달-방식)) |
 | `DISCORD_WEBHOOK_URL` | (없음) | 미설정 시 알림은 콘솔에만 출력 |
 | `SPEC_PATH` / `ROADMAP_PATH` | `./docs/*` | **대상 프로젝트 기준** 상대경로 |
@@ -102,14 +102,16 @@ UNITY_PATH=C:\Program Files\Unity\Hub\Editor\2022.3.40f1\Editor\Unity.exe
 | `UNITY_TIMEOUT_MS` | `1200000` | Unity MCP 대기/배치모드 타임아웃 (20분) |
 | `VALIDATION_MODE` | `compile` | 검수 프리셋: `lint` / `compile` / `full` / `skip` ([6-2](#6-2-검수-파이프라인)) |
 | `INFER_VERIFY` | `true` | `targetFiles`/완료 조건에서 파일·내용·프리팹·Addressables 검사 추론. 로드맵 JSON은 수정하지 않음 |
-| `STEP_JUDGE` | `true` | 기계 체크·컴파일 후 완료 조건 판정 Agent. `--force` 없이 실행 |
-| `JUDGE_TIMEOUT_MS` | `180000` | 판정 Agent 타임아웃 (3분) |
+| `STEP_JUDGE` | `true` | 기계 체크·컴파일 후 완료 조건 판정 Agent. `--force` 없이 실행. 구현과 같이 `--trust` 는 붙음 |
+| `JUDGE_TIMEOUT_MS` | `180000` | 판정 Agent 타임아웃 (3분). `AGENT_TIMEOUT_MS` 와 **별개**. 조건이 많으면 `600000`(10분) 권장 |
 | `RESUME_ON_RETRY` | `true` | 검수 실패 재시도 시 직전 Agent 세션 `--resume` |
 | `ROLLBACK_ON_FAIL` | `true` | 재시도 한도 초과 시 이번 Step delta 만 되돌림 (시작 당시 dirty 는 유지) |
 | `CREATE_WORK_BRANCH` | `true` | `run` 시작 시 `auto-work/<시각>` 브랜치 생성 (이미 `auto-work/*` 이면 유지) |
 | `RULES_MAX_CHARS` | `40000` | `.cursorrules` 등 규칙 예산. 초과 시 중간 생략 + 경고 |
 | `SPEC_MAX_CHARS` | `20000` | 기획서 예산. 초과 시 중간 생략 + 경고 |
 | `AUTO_COMMIT` | `false` | 검수 통과 시 자동 커밋. 시작 당시 dirty 파일은 add 하지 않음 |
+| `AUTO_PUSH` | `false` | 커밋 성공 후 `git push -u origin HEAD`. force push 없음 |
+| `COMMIT_LANGUAGE` | `ko` | 커밋 메시지 언어 `ko` / `en`. 형식은 항상 `{영역} - {변경}` |
 | `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` | (없음) | 자동 커밋 작성자 (미설정 시 로컬 git config) |
 | `MAX_ERROR_LINES` | `30` | 컴파일 실패 피드백에 포함할 에러 최대 줄 수 |
 | `LOG_LEVEL` | `info` | `debug` 로 하면 Agent 스트림 원문까지 출력 |
@@ -137,16 +139,18 @@ node dist/index.js init --project D:\UnityProjects\MyGame
   "acceptanceCriteria": ["완료 조건 1", "완료 조건 2"],
   "targetFiles": ["Assets/Scripts/Core"],
   "runTests": false,
-  "commitMessage": "feat: custom commit subject"
+  "commitMessage": "룰 - Game.Rules 카탈로그 추가"
 }
 ```
 
-`task` 만 필수이고 나머지는 선택입니다. 일상적으로는 **`verify` 블록을 쓰지 않아도 됩니다.** 추론으로 안 잡히는 예외만 `verify.checks` 로 덮어쓸 수 있습니다. `runTests: true` 는 **`VALIDATION_MODE=full` 일 때만** 해당 Step에서 EditMode 테스트를 실행합니다.
+`task` 만 필수이고 나머지는 선택입니다. `commitMessage` 가 `{영역} - {변경}` 이면 그 문구를 쓰고, `feat:` 같은 영문 conventional 이면 제목에서 다시 만듭니다. 일상적으로는 **`verify` 블록을 쓰지 않아도 됩니다.** 추론으로 안 잡히는 예외만 `verify.checks` 로 덮어쓸 수 있습니다. `runTests: true` 는 **`VALIDATION_MODE=full` 일 때만** 해당 Step에서 EditMode 테스트를 실행합니다.
+
+완료 조건에 **「컴파일 에러 0건」「테스트가 통과한다」** 를 넣지 마세요. 컴파일은 `VALIDATION_MODE=compile`/`full` 이, 테스트는 `full` + `runTests` 가 이미 검사합니다. 판정 Agent는 Unity/MCP 를 호출하지 못해 그 문장만으로는 통과 근거를 만들 수 없습니다. 조건은 파일·심볼·기획서 절처럼 디스크에서 증명할 내용만 적습니다.
 
 ### 4-2. `.cursorrules` 와 UnityMCP
 
-- 대상 프로젝트 루트의 `.cursorrules`, `.cursor/rules/*.mdc`, `AGENTS.md` 는 **매 CLI 실행마다 프롬프트 최상단 System Context로 주입**됩니다. C# 스타일, UniTask/Addressables 사용 원칙, MVP 패턴 강제 등을 여기에 작성하세요. 기본 예산은 40,000자입니다.
-- UnityMCP가 등록되어 있으면 자동 감지되어, Agent에게 "Editor 조작이 필요하면 MCP 도구를 직접 호출하라"는 지침이 함께 주입됩니다. 도구 호출 승인은 `CURSOR_YOLO=true`(`--force`)로 자동 처리됩니다.
+- 대상 프로젝트 루트의 `.cursorrules`, `.cursor/rules/*.mdc`, `AGENTS.md` 는 **매 CLI 실행마다 프롬프트 최상단 System Context로 주입**됩니다. C# 스타일, UniTask/Addressables 사용 원칙, MVP 패턴 강제 등을 여기에 작성하세요. 기본 예산은 40,000자입니다. `.cursor/skills` 는 구현 프롬프트에 넣지 않습니다. 커밋 형식은 스킬 유무와 관계없이 오케스트레이터가 `{영역} - {변경}` 으로 작성합니다.
+- UnityMCP가 등록되어 있으면 자동 감지되어, Agent에게 "Editor 조작이 필요하면 MCP 도구를 직접 호출하라"는 지침이 함께 주입됩니다. 도구 호출 승인은 `CURSOR_YOLO=true`(`--force`)로 자동 처리됩니다. 구현·판정 Agent 모두 `--trust` 를 받습니다. 판정은 `--force` 없이 읽기 전용입니다.
 - 오케스트레이터의 컴파일 검수도 같은 UnityMCP에 붙습니다. `tools/list` 에서 `refresh_unity` / `read_console` 등의 별칭을 고르고, 필수 도구가 없으면 사용 가능 목록과 함께 실패합니다.
 - MCP 설정은 Cursor와 동일하게 전역 `~/.cursor/mcp.json` 과 프로젝트 `.cursor/mcp.json` 을 병합해서 읽습니다. 같은 이름이 양쪽에 있으면 프로젝트 설정이 우선합니다.
 
@@ -225,6 +229,7 @@ CLI 옵션:
 | `--retries <n>` | 재시도 한도 덮어쓰기 |
 | `--validation <mode>` | `lint` / `compile` / `full` / `skip` (`VALIDATION_MODE` 덮어쓰기) |
 | `--no-commit` | 자동 커밋 비활성화 |
+| `--no-push` | 자동 푸시 비활성화 |
 | `--debug` | Agent 스트림 원문까지 출력 |
 | `--no-mcp-probe` | MCP 서버 목록 점검 생략 (`doctor`, `run`). 에디터 게이트는 유지 |
 | `--mcp-timeout <ms>` | MCP 응답 대기 시간 (기본 20000) |
@@ -260,9 +265,9 @@ npx tsx src/index.ts preview-prompt --to 1
 2. 감지된 MCP 서버 목록(전역 + 프로젝트)과 자율 조작 지침
 3. `state.json` 의 현재 진행 상태 (완료 Step, 시도 횟수)
 4. 최근 5개 Step의 핵심 요약과 변경 파일 (`SUMMARY`/`FILES`/`NEXT` 규약 우선, 없으면 한/영 키워드)
-5. 기획서 (기본 20,000자. 초과 시 중간 생략 + 경고)
+5. 기획서 (기본 20,000자. 초과 시 중간 생략 + 경고). 완료 조건은 기획서를 정본으로 해석한다
 6. 현재 Task와 완료 조건, 추론된 Verify 항목
-7. 재시도인 경우 직전 **검수 실패·Agent 실행 실패·커밋 실패** 피드백
+7. 재시도인 경우 직전 **검수 실패·Agent 실행 실패·커밋/푸시 실패** 피드백
 
 Agent CLI 가 비정상 종료(exit ≠ 0, 타임아웃)한 경우에도 출력 요약을 메모리에 남겨, 다음 시도 프롬프트에 반영합니다.
 스트림에 토큰 usage가 있으면 `state.usage` 에 합산하고, 파이프라인 종료 시 로그와 Discord에 남깁니다.
@@ -287,15 +292,19 @@ Agent CLI 가 비정상 종료(exit ≠ 0, 타임아웃)한 경우에도 출력 
 | Git Diff 린트 | tracked `git diff HEAD` + untracked 텍스트 파일 본문 검사. `Debug.Log` / `TODO` / 충돌 마커 등. `.png`·`.fbx` 등 바이너리·에셋은 생략 | 컨벤션 위반 |
 | Unity 컴파일 | `compile`/`full` — UnityMCP `refresh` + 콘솔 `error CS####` (에디터를 끄지 않음). Play Mode 는 잠시 끄고 끝나면 복구 | 에러 상위 N개를 피드백에 포함 |
 | EditMode 테스트 | `full` + `runTests: true` — UnityMCP `run_tests` / `get_test_job` (batch 채널은 NUnit XML) | 실패 테스트명·메시지를 피드백에 포함 |
-| 완료 조건 판정 | 앞 단계 통과 후 읽기 전용 Agent가 조건마다 `evidence`(파일 경로)를 붙여 판정. 항목 수 불일치·근거 없는 ok는 실패 | `reasons`를 재시도 피드백에 포함 |
+| 완료 조건 판정 | 앞 단계 통과 후 읽기 전용 Agent가 기획서를 정본으로 조건마다 `evidence`(구현 파일 경로)를 붙여 판정. Unity/MCP 호출 없음. `Assets/`·`server/`·`Packages/`·`Docs/` 경로와 `:줄` 접미사를 디스크에서 확인. 항목 수 불일치·근거 없는 ok는 실패 | `reasons`를 재시도 피드백에 포함 |
 
 `lint`/`compile`/`full` 은 **Git 저장소가 필수**입니다. `compile`/`full`(mcp) 은 **run 시작 전에** UnityMCP 연결과 Editor 인스턴스를 확인합니다. 없으면 Agent를 시작하지 않습니다. `UNITY_PATH` 가 있으면 에디터를 띄운 뒤 대기합니다 (`UNITY_LAUNCH_EDITOR`).
 
 기존 `.gitignore` 가 있으면 빠진 Unity 규칙(`Library/`, `Temp/` 등)만 덧붙입니다. `Library/` 와 `[Ll]ibrary/` 는 같은 것으로 봅니다.
 
-검수를 모두 통과하면 자동 커밋(`AUTO_COMMIT=true`) 시 **이번 Step에서 새로 더러워진 파일만** `git add` 합니다. Step 시작 전에 이미 dirty였던 파일은 통째로 커밋하지 않습니다. 재시도 한도를 넘기면 그 Step이 만든 변경만 롤백하고, 시작 당시 dirty는 남깁니다.
+검수를 모두 통과하면 자동 커밋(`AUTO_COMMIT=true`) 시 **이번 Step에서 새로 더러워진 파일만** `git add` 합니다. Step 시작 전에 이미 dirty였던 파일은 통째로 커밋하지 않습니다. `.env` / `credentials.json` 은 제외합니다. 재시도 한도를 넘기면 그 Step이 만든 변경만 롤백하고, 시작 당시 dirty는 남깁니다.
 
-`AUTO_COMMIT=true` 인데 커밋이 실패하면 Step 을 완료 처리하지 않고, 검수 실패와 동일하게 피드백을 주입해 재시도합니다.
+자동 커밋 메시지는 항상 `{영역} - {변경}` 입니다. 관심사가 섞이면 영역별로 나눕니다. 언어만 `COMMIT_LANGUAGE`(`ko`/`en`)로 바꿉니다.
+
+`AUTO_PUSH=true` 이면 커밋 후 `git push -u origin HEAD` 합니다. `--force` 는 쓰지 않습니다.
+
+`AUTO_COMMIT=true` 인데 커밋이나 푸시가 실패하면 Step 을 완료 처리하지 않고, 검수 실패와 동일하게 피드백을 주입해 재시도합니다.
 
 ### 6-3. 검수 건너뛰기
 
@@ -311,7 +320,7 @@ node dist/index.js run --validation skip
 
 - 커밋 메시지용 변경 파일 **수집**은 유지하지만, 변경 없음·린트 위반으로 실패시키지 않습니다.
 - Agent 프로세스 자체가 실패한 경우에만 재시도합니다.
-- `AUTO_COMMIT=true` 이면 검증되지 않은 코드가 커밋될 수 있으며, 커밋 본문에 `NOTE: validation skipped (VALIDATION_MODE=skip).` 가 기록됩니다.
+- `AUTO_COMMIT=true` 이면 검증되지 않은 코드가 커밋될 수 있습니다. 메시지는 여전히 `{영역} - {변경}` 입니다.
 
 문제를 해결한 뒤에는 `VALIDATION_MODE=compile`(또는 `lint`/`full`) 로 되돌리는 것을 권장합니다.
 
@@ -321,7 +330,7 @@ node dist/index.js run --validation skip
 | --- | --- |
 | 🚀 Step 시작 | 블루 |
 | 🎮 검수 진행 중 | 퍼플 |
-| ✅ Step 성공 및 (선택) 커밋 완료 | 그린 |
+| ✅ Step 성공 및 (선택) 커밋/푸시 완료 | 그린 |
 | ⚠️ 검수 실패 및 재수정 지시 | 옐로 |
 | 🚨 최대 재시도 초과 (사람 개입 요청) | 레드 |
 
@@ -350,7 +359,7 @@ node dist/index.js run --validation skip
 
 - Agent CLI 비정상 종료·타임아웃
 - 검수 실패 (변경 없음, 린트 위반, Verify/컴파일/테스트/판정 실패)
-- `AUTO_COMMIT=true` 인데 git commit 실패
+- `AUTO_COMMIT=true` 인데 git commit 또는 (`AUTO_PUSH` 일 때) push 실패
 
 ---
 
@@ -371,8 +380,9 @@ cursorAutoWork/
 │  ├─ unityAssetInspect.ts  # 프리팹 YAML · Addressables 디스크 검사
 │  ├─ inferVerify.ts        # targetFiles/완료 조건에서 체크 추론
 │  ├─ stepVerifier.ts       # 디스크 Verify 실행
-│  ├─ stepJudge.ts          # 완료 조건 판정 Agent
-│  ├─ gitManager.ts         # 스냅샷, scoped lint, gitignore 보완, 커밋/롤백
+│  ├─ stepJudge.ts          # 완료 조건 판정 Agent (기획서 정본, evidence 경로 확인)
+│  ├─ projectCommit.ts      # `{영역} - {변경}` 메시지, 관심사 묶음, 시크릿 제외
+│  ├─ gitManager.ts         # 스냅샷, scoped lint, gitignore 보완, 커밋/푸시/롤백
 │  ├─ runLock.ts            # runtime/run.lock
 │  ├─ memoryManager.ts      # Fresh Context, SUMMARY 파싱, state.json
 │  ├─ textBudget.ts         # 규칙/기획서 중간 생략
@@ -417,6 +427,11 @@ cursorAutoWork/
 | `agent` 실행 오류: 명령줄이 너무 깁니다. | Windows `cmd.exe` 의 8191자 명령행 상한입니다. `CURSOR_PROMPT_DELIVERY=auto`(기본값)면 stdin으로 자동 우회합니다. 그래도 실패하면 `file` 로 고정하세요 ([4-4](#4-4-프롬프트-전달-방식)). |
 | `Git 저장소가 아닙니다` (fatal) | `lint`/`compile`/`full` 은 Git Diff 검수가 필요합니다. 대상 프로젝트에서 `git init` 하거나 `VALIDATION_MODE=skip` 을 사용하세요. |
 | `agent` 가 exit code ≠ 0 으로 종료 | Agent 실행 자체 실패로 재시도합니다. CLI 인증·`CURSOR_AGENT_BIN` 경로를 확인하세요. |
+| `Workspace Trust Required` 후 판정 JSON 실패 | 비대화형 `agent -p` 가 대상 폴더를 아직 신뢰하지 않음. 구현은 `--force`, 판정은 `--force` 없음. 현재는 양쪽 모두 `--trust` 를 붙인다. 예전 `dist` 이면 `npm run build` 후 재실행. 한 번 `cd` 대상 프로젝트 후 `agent -p "ok" --trust` 로 신뢰를 남겨도 된다. |
+| 판정 `JSON 으로 해석하지 못했습니다` + 중간 설명만 남음 | 판정이 `JUDGE_TIMEOUT_MS`(기본 3분)에 잘림. `AGENT_TIMEOUT_MS` 를 늘려도 판정은 그대로다. `.env` 에 `JUDGE_TIMEOUT_MS=600000` 등을 넣고 **run 을 다시 시작**. |
+| 판정: 컴파일 0건/테스트 그린을 기계 체크로 증명 불가 | 완료 조건에서 그 문장을 뺀다. 컴파일은 `compile`/`full`, 테스트는 `full`+`runTests` 가 담당. 판정은 Unity/MCP 를 호출하지 않는다. |
+| 판정: `server/...` evidence 가 디스크에 없음 | 예전 빌드는 `Assets/` 경로만 확인했다. 지금 빌드는 `server/` 등과 `:줄` 을 허용한다. `npm run build` 후 Step 을 다시 돈다. |
+| 푸시 실패로 Step 이 완료 안 됨 | `AUTO_PUSH=true` 인데 remote/권한이 없음. `origin` 과 인증을 확인하거나 `--no-push`. force push 는 하지 않는다. |
 | 검수 통과 후 커밋만 반복 실패 | `git` 권한·`.gitignore`·`GIT_AUTHOR_*` 설정을 확인하세요. Step 은 완료되지 않고 재시도됩니다. |
 | 내 미커밋 파일이 커밋에 안 들어감 | 시작 당시 dirty 파일은 자동 커밋에서 빼 둡니다. 의도된 동작입니다. |
 | `status` 가 `paused` 로 멈춤 | `Ctrl+C` 로 중단된 상태입니다. 문제 없으면 `run` 을 다시 실행하면 `currentStepId` 부터 이어집니다. |

@@ -7,6 +7,7 @@ import dotenv from 'dotenv';
 import { createLogger } from './logger';
 import { findUnityMcpEntry } from './mcpProbe';
 import type {
+  CommitLanguage,
   LogLevel,
   OrchestratorConfig,
   PromptDelivery,
@@ -54,6 +55,16 @@ function warnDeprecatedEnvVars(): void {
       log.warn(`${key} 은(는) 제거되었습니다. VALIDATION_MODE (lint|compile|full|skip) 를 사용하세요.`);
     }
   }
+}
+
+function parseCommitLanguage(raw: string): CommitLanguage {
+  const normalized = raw.toLowerCase();
+  if (normalized === 'en' || normalized === 'english') return 'en';
+  if (normalized === 'ko' || normalized === 'kr' || normalized === 'korean' || normalized === '') {
+    return 'ko';
+  }
+  log.warn(`알 수 없는 COMMIT_LANGUAGE='${raw}' — ko 로 대체합니다.`);
+  return 'ko';
 }
 
 function parseValidationMode(raw: string): ValidationMode {
@@ -178,6 +189,8 @@ export function loadConfig(overrides: Partial<OrchestratorConfig> = {}): Orchest
     rulesMaxChars: overrides.rulesMaxChars ?? num('RULES_MAX_CHARS', 40_000),
     specMaxChars: overrides.specMaxChars ?? num('SPEC_MAX_CHARS', 20_000),
     autoCommit: overrides.autoCommit ?? bool('AUTO_COMMIT', false),
+    autoPush: overrides.autoPush ?? bool('AUTO_PUSH', false),
+    commitLanguage: overrides.commitLanguage ?? parseCommitLanguage(str('COMMIT_LANGUAGE', 'ko')),
     gitAuthorName: overrides.gitAuthorName ?? str('GIT_AUTHOR_NAME'),
     gitAuthorEmail: overrides.gitAuthorEmail ?? str('GIT_AUTHOR_EMAIL'),
     maxErrorLines: overrides.maxErrorLines ?? num('MAX_ERROR_LINES', 30),

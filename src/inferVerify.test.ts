@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { contractResult, expandBraces, inferVerifyChecks, mergeVerifyChecks } from './inferVerify';
 import { diffHasMeaningfulEdits, isTrivialDiffLine } from './gitManager';
-import { finalizeJudgeVerdict, parseJudgeVerdict } from './stepJudge';
+import { extractEvidenceRelPath, finalizeJudgeVerdict, parseJudgeVerdict } from './stepJudge';
 
 describe('inferVerifyChecks', () => {
   it('expands braces and adds exists from targetFiles', () => {
@@ -146,6 +149,22 @@ describe('parseJudgeVerdict', () => {
       }),
     );
     const finalized = finalizeJudgeVerdict(parsed, ['IGameState 가 있다']);
+    assert.equal(finalized.ok, true);
+  });
+
+  it('accepts server/ evidence with a line suffix when the file exists', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'judge-ev-'));
+    fs.mkdirSync(path.join(dir, 'server', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'server', 'src', 'Program.cs'), 'class Program {}\n');
+    assert.equal(extractEvidenceRelPath('server/src/Program.cs:17'), 'server/src/Program.cs');
+    const parsed = parseJudgeVerdict(
+      JSON.stringify({
+        ok: true,
+        reasons: [],
+        criteria: [{ index: 0, ok: true, evidence: 'server/src/Program.cs:17', note: 'gateway' }],
+      }),
+    );
+    const finalized = finalizeJudgeVerdict(parsed, ['server/ 에 게이트웨이가 있다'], dir);
     assert.equal(finalized.ok, true);
   });
 });

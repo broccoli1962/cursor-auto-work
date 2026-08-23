@@ -1,14 +1,147 @@
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { promisify } from 'node:util';
+import readline from 'node:readline';
 
 import { createLogger } from './logger';
+import { killChildTree } from './processKill';
 import type { GitDiffResult, OrchestratorConfig } from './types';
 
-const execFileAsync = promisify(execFile);
 const log = createLogger('git');
+
+/** execFile maxBuffer 대신 spawn 으로 흘려 읽는다. 본문은 자르지 않는다. */
+const STDERR_TAIL_BYTES = 16_000;
+
+class GitCommandError extends Error {
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number | null;
+
+  constructor(message: string, stdout: string, stderr: string, exitCode: number | null) {
+    super(message);
+    this.name = 'GitCommandError';
+    this.stdout = stdout;
+    this.stderr = stderr;
+    this.exitCode = exitCode;
+  }
+}
+
+function pushTail(chunks: Buffer[], chunk: Buffer, cap: number): number {
+  chunks.push(chunk);
+  let total = chunks.reduce((sum, item) => sum + item.length, 0);
+  while (total > cap && chunks.length > 1) {
+    total -= chunks[0]!.length;
+    chunks.shift();
+  }
+  return total;
+}
+
+function runGit(
+  cwd: string,
+  args: string[],
+  options: { env?: NodeJS.ProcessEnv } = {},
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', args, {
+      cwd,
+      env: options.env,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const outChunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      outChunks.push(chunk);
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      pushTail(errChunks, chunk, STDERR_TAIL_BYTES);
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      const stdout = Buffer.concat(outChunks).toString('utf8');
+      const stderr = Buffer.concat(errChunks).toString('utf8');
+      if (code !== 0) {
+        reject(
+          new GitCommandError(
+            `git ${args.join(' ')} failed (${code}): ${stderr.trim() || stdout.trim() || 'no output'}`,
+            stdout,
+            stderr,
+            code,
+          ),
+        );
+        return;
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+/** 한 줄씩 콜백. false 를 반환하면 프로세스를 끊고 성공으로 끝낸다. */
+function runGitLines(
+  cwd: string,
+  args: string[],
+  onLine: (line: string) => boolean | void,
+  options: { env?: NodeJS.ProcessEnv } = {},
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', args, {
+      cwd,
+      env: options.env,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let pending = '';
+    let stopped = false;
+    const errChunks: Buffer[] = [];
+
+    const feed = (chunk: string) => {
+      if (stopped) return;
+      pending += chunk;
+      let idx = pending.indexOf('\n');
+      while (idx !== -1) {
+        const line = pending.slice(0, idx).replace(/\r$/, '');
+        pending = pending.slice(idx + 1);
+        if (onLine(line) === false) {
+          stopped = true;
+          killChildTree(child);
+          return;
+        }
+        idx = pending.indexOf('\n');
+      }
+    };
+
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => feed(chunk));
+    child.stderr.on('data', (chunk: Buffer) => {
+      pushTail(errChunks, chunk, STDERR_TAIL_BYTES);
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (!stopped && pending) {
+        const line = pending.replace(/\r$/, '');
+        pending = '';
+        if (onLine(line) === false) stopped = true;
+      }
+      if (code !== 0 && !stopped) {
+        const stderr = Buffer.concat(errChunks).toString('utf8');
+        reject(
+          new GitCommandError(
+            `git ${args.join(' ')} failed (${code}): ${stderr.trim() || 'no output'}`,
+            '',
+            stderr,
+            code,
+          ),
+        );
+        return;
+      }
+      resolve();
+    });
+  });
+}
 
 /** 커밋 전에 걸러내야 할 컨벤션 위반 패턴 (git diff + 라인 형식) */
 const CONVENTION_RULES: { pattern: RegExp; message: string }[] = [
@@ -18,13 +151,39 @@ const CONVENTION_RULES: { pattern: RegExp; message: string }[] = [
   { pattern: /^\+.*<<<<<<<\s/, message: '머지 충돌 마커가 남아 있습니다.' },
 ];
 
-async function git(config: OrchestratorConfig, args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync('git', args, {
-    cwd: config.targetProjectPath,
-    maxBuffer: 32 * 1024 * 1024,
-    windowsHide: true,
-  });
-  return stdout;
+async function git(
+  config: OrchestratorConfig,
+  args: string[],
+  env?: NodeJS.ProcessEnv,
+): Promise<string> {
+  return runGit(config.targetProjectPath, args, { env });
+}
+
+function fileStartsWithNul(absolute: string): boolean {
+  const fd = fs.openSync(absolute, 'r');
+  try {
+    const buf = Buffer.alloc(8192);
+    const n = fs.readSync(fd, buf, 0, 8192, 0);
+    return buf.subarray(0, n).includes(0);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+async function forEachFileLine(
+  absolute: string,
+  onLine: (line: string) => boolean | void,
+): Promise<void> {
+  const stream = fs.createReadStream(absolute, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      if (onLine(line) === false) break;
+    }
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
 }
 
 export async function isGitRepo(config: OrchestratorConfig): Promise<boolean> {
@@ -151,18 +310,21 @@ export function diffHasMeaningfulEdits(diffText: string): boolean {
   return false;
 }
 
-function fileHasMeaningfulContent(projectRoot: string, relativePath: string): boolean {
+async function fileHasMeaningfulContent(projectRoot: string, relativePath: string): Promise<boolean> {
   const normalized = relativePath.replace(/\\/g, '/');
   if (normalized.endsWith('.meta') || normalized.includes('/Logs/')) return false;
   if (BINARY_EXTENSIONS.has(path.extname(normalized).toLowerCase())) return true;
   const absolute = path.join(projectRoot, relativePath);
   try {
-    const raw = fs.readFileSync(absolute);
-    if (raw.includes(0)) return true;
-    return raw
-      .toString('utf8')
-      .split(/\r?\n/)
-      .some((line) => !TRIVIAL_LINE.test(line));
+    if (fileStartsWithNul(absolute)) return true;
+    let found = false;
+    await forEachFileLine(absolute, (line) => {
+      if (!TRIVIAL_LINE.test(line)) {
+        found = true;
+        return false;
+      }
+    });
+    return found;
   } catch {
     return false;
   }
@@ -179,66 +341,80 @@ export async function hasMeaningfulEdits(
   const fresh = files.filter((file) => untracked.has(normalizeRepoPath(file)));
 
   for (const file of fresh) {
-    if (fileHasMeaningfulContent(config.targetProjectPath, file)) return true;
+    if (await fileHasMeaningfulContent(config.targetProjectPath, file)) return true;
   }
-  if (tracked.length > 0) {
-    const diffText = await gitWithPathspecs(config, ['diff', 'HEAD', '--unified=0'], tracked).catch(() =>
-      gitWithPathspecs(config, ['diff', '--unified=0'], tracked),
-    );
-    if (diffHasMeaningfulEdits(diffText)) return true;
-  }
-  return false;
+  if (tracked.length === 0) return false;
+
+  let found = false;
+  const onLine = (line: string): boolean | void => {
+    if (line.startsWith('Binary files ')) {
+      found = true;
+      return false;
+    }
+    if (
+      (line.startsWith('+') || line.startsWith('-')) &&
+      !line.startsWith('+++') &&
+      !line.startsWith('---') &&
+      !isTrivialDiffLine(line)
+    ) {
+      found = true;
+      return false;
+    }
+  };
+  await gitLinesWithPathspecs(config, ['diff', 'HEAD', '--unified=0'], tracked, onLine).catch(() =>
+    gitLinesWithPathspecs(config, ['diff', '--unified=0'], tracked, onLine),
+  );
+  return found;
 }
 
-function scanDiffText(diffText: string, violations: string[]): { insertions: number; deletions: number } {
+function createDiffScanner(violations: string[]) {
+  let currentFile = '';
   let insertions = 0;
   let deletions = 0;
-  let currentFile = '';
-
-  for (const line of diffText.split(/\r?\n/)) {
-    if (line.startsWith('+++ b/')) {
-      currentFile = line.slice(6);
-      continue;
-    }
-    if (line.startsWith('+') && !line.startsWith('+++')) {
-      insertions += 1;
-      recordViolation(currentFile, line, violations);
-    }
-    if (line.startsWith('-') && !line.startsWith('---')) {
-      deletions += 1;
-    }
-  }
-
-  return { insertions, deletions };
+  return {
+    line(text: string): void {
+      if (text.startsWith('+++ b/')) {
+        currentFile = text.slice(6);
+        return;
+      }
+      if (text.startsWith('+') && !text.startsWith('+++')) {
+        insertions += 1;
+        recordViolation(currentFile, text, violations);
+      }
+      if (text.startsWith('-') && !text.startsWith('---')) {
+        deletions += 1;
+      }
+    },
+    result(): { insertions: number; deletions: number } {
+      return { insertions, deletions };
+    },
+  };
 }
 
 /** untracked 파일 본문을 diff + 라인 형식으로 검사한다 (index 를 건드리지 않음). */
-function scanUntrackedFile(
+async function scanUntrackedFile(
   projectRoot: string,
   relativePath: string,
   violations: string[],
-): number {
+): Promise<number> {
   if (skipLintFile(relativePath)) return 0;
 
   const absolute = path.join(projectRoot, relativePath);
-  let content: string;
   try {
-    const raw = fs.readFileSync(absolute);
-    if (raw.includes(0)) {
+    if (fileStartsWithNul(absolute)) {
       log.debug(`바이너리 untracked 파일 린트 생략: ${relativePath}`);
       return 0;
     }
-    content = raw.toString('utf8');
+    let count = 0;
+    await forEachFileLine(absolute, (body) => {
+      recordViolation(relativePath, `+${body}`, violations);
+      count += 1;
+    });
+    return count;
   } catch (error) {
     log.debug(`untracked 파일 읽기 실패(무시): ${relativePath} — ${(error as Error).message}`);
     return 0;
   }
-
-  const lines = content.split(/\r?\n/);
-  for (const body of lines) {
-    recordViolation(relativePath, `+${body}`, violations);
-  }
-  return lines.length;
 }
 
 const emptyDiff = (): GitDiffResult => ({
@@ -249,39 +425,55 @@ const emptyDiff = (): GitDiffResult => ({
   violations: [],
 });
 
-function splitLines(text: string): string[] {
-  return text
-    .split(/\r?\n/)
-    .map((line) => normalizeRepoPath(line.trim()))
-    .filter(Boolean);
+async function listGitLines(config: OrchestratorConfig, args: string[]): Promise<string[]> {
+  const lines: string[] = [];
+  await runGitLines(config.targetProjectPath, args, (line) => {
+    const normalized = normalizeRepoPath(line.trim());
+    if (normalized) lines.push(normalized);
+  });
+  return lines;
 }
 
 export async function listWorkingTreeFiles(config: OrchestratorConfig): Promise<string[]> {
   if (!(await isGitRepo(config))) return [];
 
-  const nameOnly = await git(config, ['diff', 'HEAD', '--name-only']).catch(() =>
-    git(config, ['diff', '--name-only']),
+  const nameOnly = await listGitLines(config, ['diff', 'HEAD', '--name-only']).catch(() =>
+    listGitLines(config, ['diff', '--name-only']),
   );
-  const untrackedRaw = await git(config, ['ls-files', '--others', '--exclude-standard']).catch(() => '');
-  return [...new Set([...splitLines(nameOnly), ...splitLines(untrackedRaw)])];
+  const untracked = await listGitLines(config, ['ls-files', '--others', '--exclude-standard']).catch(
+    () => [],
+  );
+  return [...new Set([...nameOnly, ...untracked])];
 }
 
 async function listUntrackedFiles(config: OrchestratorConfig): Promise<Set<string>> {
   if (!(await isGitRepo(config))) return new Set();
-  const raw = await git(config, ['ls-files', '--others', '--exclude-standard']).catch(() => '');
-  return new Set(splitLines(raw));
+  const raw = await listGitLines(config, ['ls-files', '--others', '--exclude-standard']).catch(() => []);
+  return new Set(raw);
 }
 
 const GIT_PATHSPEC_CHUNK = 64;
 
-async function gitWithPathspecs(config: OrchestratorConfig, args: string[], files: string[]): Promise<string> {
-  if (files.length === 0) return '';
-  const chunks: string[] = [];
+async function gitLinesWithPathspecs(
+  config: OrchestratorConfig,
+  args: string[],
+  files: string[],
+  onLine: (line: string) => boolean | void,
+): Promise<void> {
+  if (files.length === 0) return;
+  let stop = false;
+  const wrapped = (line: string): boolean | void => {
+    if (stop) return;
+    if (onLine(line) === false) {
+      stop = true;
+      return false;
+    }
+  };
   for (let i = 0; i < files.length; i += GIT_PATHSPEC_CHUNK) {
+    if (stop) return;
     const slice = files.slice(i, i + GIT_PATHSPEC_CHUNK);
-    chunks.push(await git(config, [...args, '--', ...slice]));
+    await runGitLines(config.targetProjectPath, [...args, '--', ...slice], wrapped);
   }
-  return chunks.join('');
 }
 
 const MAX_UNIFIED_DIFF_CHARS = 20_000;
@@ -298,10 +490,18 @@ export async function collectUnifiedDiff(
   const parts: string[] = [];
 
   if (tracked.length > 0) {
-    const diff = await gitWithPathspecs(config, ['diff', 'HEAD', '--unified=3'], tracked).catch(() =>
-      gitWithPathspecs(config, ['diff', '--unified=3'], tracked),
+    const diffLines: string[] = [];
+    let used = 0;
+    const onLine = (line: string): boolean | void => {
+      if (used >= MAX_UNIFIED_DIFF_CHARS) return false;
+      diffLines.push(line);
+      used += line.length + 1;
+      if (used >= MAX_UNIFIED_DIFF_CHARS) return false;
+    };
+    await gitLinesWithPathspecs(config, ['diff', 'HEAD', '--unified=3'], tracked, onLine).catch(() =>
+      gitLinesWithPathspecs(config, ['diff', '--unified=3'], tracked, onLine),
     );
-    if (diff.trim()) parts.push(diff);
+    if (diffLines.length > 0) parts.push(diffLines.join('\n'));
   }
 
   for (const file of fresh.slice(0, 8)) {
@@ -339,16 +539,21 @@ export async function lintChangedFiles(
   const fresh = files.filter((file) => untracked.has(normalizeRepoPath(file)));
 
   if (tracked.length > 0) {
-    const diffText = await gitWithPathspecs(config, ['diff', 'HEAD', '--unified=0'], tracked).catch(() =>
-      gitWithPathspecs(config, ['diff', '--unified=0'], tracked),
+    const scanner = createDiffScanner(violations);
+    await gitLinesWithPathspecs(config, ['diff', 'HEAD', '--unified=0'], tracked, (line) => {
+      scanner.line(line);
+    }).catch(() =>
+      gitLinesWithPathspecs(config, ['diff', '--unified=0'], tracked, (line) => {
+        scanner.line(line);
+      }),
     );
-    const counted = scanDiffText(diffText, violations);
+    const counted = scanner.result();
     insertions += counted.insertions;
     deletions += counted.deletions;
   }
 
   for (const file of fresh) {
-    insertions += scanUntrackedFile(config.targetProjectPath, file, violations);
+    insertions += await scanUntrackedFile(config.targetProjectPath, file, violations);
   }
 
   return { insertions, deletions, violations };
@@ -441,16 +646,13 @@ export async function commitAll(
   if (config.gitAuthorName) env.GIT_COMMITTER_NAME = config.gitAuthorName;
   if (config.gitAuthorEmail) env.GIT_COMMITTER_EMAIL = config.gitAuthorEmail;
 
+  await git(config, ['restore', '--staged', '--', '.']).catch(() => undefined);
+
   for (let i = 0; i < files.length; i += GIT_PATHSPEC_CHUNK) {
     await git(config, ['add', '--', ...files.slice(i, i + GIT_PATHSPEC_CHUNK)]);
   }
   try {
-    await execFileAsync('git', args, {
-      cwd: config.targetProjectPath,
-      env,
-      maxBuffer: 8 * 1024 * 1024,
-      windowsHide: true,
-    });
+    await git(config, args, env);
   } catch (error) {
     const execError = error as { stdout?: string; stderr?: string };
     const combined = `${execError.stdout ?? ''}\n${execError.stderr ?? ''}`;
@@ -464,6 +666,19 @@ export async function commitAll(
   const hash = (await git(config, ['rev-parse', '--short', 'HEAD'])).trim();
   log.info(`커밋 완료: ${hash} - ${message.split('\n')[0]}`);
   return hash;
+}
+
+/** force push 없이 현재 브랜치를 origin 에 올린다 (`-u origin HEAD`). */
+export async function pushCurrentBranch(config: OrchestratorConfig): Promise<string> {
+  const branch = await currentGitBranch(config);
+  if (!branch || branch === 'HEAD') {
+    throw new Error('현재 브랜치를 확인할 수 없어 푸시하지 않았습니다.');
+  }
+
+  await git(config, ['push', '-u', 'origin', 'HEAD']);
+  const summary = `${branch} → origin`;
+  log.info(`푸시 완료: ${summary}`);
+  return summary;
 }
 
 const UNITY_IGNORE_PATTERNS = [

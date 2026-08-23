@@ -8,8 +8,7 @@
       "task": "Assets/Scripts 하위에 Core, Gameplay, UI 폴더를 만들고 각각 asmdef 를 생성한다. Core 는 다른 어셈블리를 참조하지 않고, Gameplay 와 UI 는 Core 만 참조하도록 설정한다. Core/Constants/GameConstants.cs 에 씬 이름, Addressables 라벨 등 전역 상수를 정의한다.",
       "acceptanceCriteria": [
         "Assets/Scripts/{Core,Gameplay,UI} 폴더와 asmdef 가 존재한다",
-        "어셈블리 간 순환 참조가 없다",
-        "C# 컴파일 에러가 0건이다"
+        "어셈블리 간 순환 참조가 없다"
       ],
       "targetFiles": [
         "Assets/Scripts/Core",
@@ -23,8 +22,7 @@
       "task": "Core/Logging/GameLogger.cs 를 구현해 UnityEngine.Debug 호출을 한 곳으로 캡슐화하고, DEVELOPMENT_BUILD/UNITY_EDITOR 심볼에서만 출력되도록 한다. Core/Events/EventBus.cs 에 제네릭 구독/발행 API 를 구현한다.",
       "acceptanceCriteria": [
         "GameLogger 가 조건부 컴파일로 로그를 제어한다",
-        "EventBus 가 Subscribe/Unsubscribe/Publish 를 제공하며 구독 해제 누수가 없다",
-        "C# 컴파일 에러가 0건이다"
+        "EventBus 가 Subscribe/Unsubscribe/Publish 를 제공하며 구독 해제 누수가 없다"
       ],
       "targetFiles": [
         "Assets/Scripts/Core/Logging/GameLogger.cs",
@@ -37,8 +35,7 @@
       "task": "Gameplay/StateMachine 에 IGameState 인터페이스와 GameStateMachine 을 구현한다. Boot, Menu, Play, Result 상태를 정의하고 상태 전환(EnterAsync/ExitAsync)을 UniTask 로 처리한다. 코루틴은 사용하지 않는다.",
       "acceptanceCriteria": [
         "IGameState 를 구현한 4개 상태 클래스가 존재한다",
-        "모든 비동기 전환이 UniTask 로 작성되어 있다",
-        "C# 컴파일 에러가 0건이다"
+        "모든 비동기 전환이 UniTask 로 작성되어 있다"
       ],
       "targetFiles": [
         "Assets/Scripts/Gameplay/StateMachine"
@@ -50,8 +47,7 @@
       "task": "UI/MainMenu 에 MVP 패턴으로 MainMenuView(MonoBehaviour), MainMenuPresenter, MainMenuModel 을 구현한다. UnityMCP 를 사용해 MainMenu 프리팹과 필요한 GameObject/Component 를 실제로 생성하고, Addressables 그룹 'UI' 에 'ui/main_menu' 주소로 등록한다.",
       "acceptanceCriteria": [
         "Presenter 에 UnityEngine 의존성이 없다",
-        "MainMenu 프리팹이 Addressables 그룹 UI 에 등록되어 있다",
-        "C# 컴파일 에러가 0건이다"
+        "MainMenu 프리팹이 Addressables 그룹 UI 에 등록되어 있다"
       ],
       "targetFiles": [
         "Assets/Scripts/UI/MainMenu",
@@ -65,13 +61,13 @@
       "task": "Tests/EditMode 어셈블리를 생성하고 EventBus 와 GameStateMachine 에 대한 NUnit 테스트를 작성한다. 구독 해제 후 이벤트가 전달되지 않는지, 상태 전환 순서가 보장되는지 검증한다.",
       "acceptanceCriteria": [
         "Tests/EditMode asmdef 가 존재하고 nunit 참조가 설정되어 있다",
-        "모든 EditMode 테스트가 통과한다"
+        "EventBus 와 GameStateMachine 테스트 클래스가 존재한다"
       ],
       "targetFiles": [
         "Assets/Tests/EditMode"
       ],
       "runTests": true,
-      "commitMessage": "test: add EditMode unit tests for core systems"
+      "commitMessage": "테스트 - EventBus와 GameStateMachine EditMode 추가"
     }
   ]
 }
