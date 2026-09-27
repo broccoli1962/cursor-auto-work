@@ -44,7 +44,7 @@
     {
       "id": 4,
       "title": "메인 메뉴 UI (MVP) 및 Addressables 연동",
-      "task": "UI/MainMenu 에 MVP 패턴으로 MainMenuView(MonoBehaviour), MainMenuPresenter, MainMenuModel 을 구현한다. UnityMCP 를 사용해 MainMenu 프리팹과 필요한 GameObject/Component 를 실제로 생성하고, Addressables 그룹 'UI' 에 'ui/main_menu' 주소로 등록한다.",
+      "task": "UI/MainMenu 에 MVP 패턴으로 MainMenuView(MonoBehaviour), MainMenuPresenter, MainMenuModel 을 구현한다. Unity CLI(`unity command`)로 MainMenu 프리팹과 필요한 GameObject/Component 를 실제로 생성하고, Addressables 그룹 'UI' 에 'ui/main_menu' 주소로 등록한다.",
       "acceptanceCriteria": [
         "Presenter 에 UnityEngine 의존성이 없다",
         "MainMenu 프리팹이 Addressables 그룹 UI 에 등록되어 있다"

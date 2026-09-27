@@ -6,6 +6,7 @@ import { createLogger } from './logger';
 import { listMcpServerNames } from './mcpProbe';
 import { inferVerifyChecks, mergeVerifyChecks } from './inferVerify';
 import { formatVerifyForPrompt } from './stepVerifier';
+import { formatPlanAuthority } from './autonomy';
 import { budgetText } from './textBudget';
 import type {
   AgentRunResult,
@@ -13,7 +14,6 @@ import type {
   OrchestratorState,
   RoadmapStep,
   StepMemory,
-  ValidationMode,
   ValidationReport,
 } from './types';
 
@@ -184,7 +184,8 @@ function renderMemories(state: OrchestratorState): string {
     .join('\n');
 }
 
-function buildOutputContract(mode: ValidationMode): string {
+function buildOutputContract(config: OrchestratorConfig): string {
+  const mode = config.validationMode;
   const lines = [
     '# [OUTPUT CONTRACT] 작업 규약',
     '- 질문하지 말고 끝까지 자율적으로 완료할 것. 확인이 필요하면 가장 합리적인 선택을 하고 그 이유를 남길 것.',
@@ -193,7 +194,9 @@ function buildOutputContract(mode: ValidationMode): string {
 
   if (mode === 'compile' || mode === 'full') {
     lines.push(
-      '- 오케스트레이터가 열린 Unity Editor(MCP) 로 컴파일 검수를 수행한다. 에디터를 끄지 말고 C# 컴파일 에러가 없어야 한다.',
+      config.unityValidationBackend === 'batch'
+        ? '- 오케스트레이터가 Unity 배치모드로 컴파일 검수를 수행한다. 같은 프로젝트를 연 에디터가 있으면 Library 잠금으로 실패할 수 있다.'
+        : '- 오케스트레이터가 열린 Unity Editor 에 공식 Unity CLI 로 컴파일 검수를 수행한다. 에디터를 끄지 말고 C# 컴파일 에러가 없어야 한다.',
     );
   }
   if (mode === 'full') {
@@ -213,6 +216,7 @@ function buildOutputContract(mode: ValidationMode): string {
     '  SUMMARY: <무엇을 구현했는지>',
     '  FILES: <생성/수정한 주요 파일 경로들>',
     '  NEXT: <다음 Step 에서 이어서 할 일>',
+    '  LESSON: <이번 시도에서 실패한 이유와 버린 접근. 없으면 생략>',
   );
 
   return lines.join('\n');
@@ -251,13 +255,29 @@ export function buildStepPrompt(args: BuildPromptArgs): string {
     ].join('\n'),
   );
 
-  if (mcpServers.length > 0) {
+  if (config.unityValidationBackend === 'cli' && (config.validationMode === 'compile' || config.validationMode === 'full')) {
     sections.push(
       [
-        '# [TOOLING] 사용 가능한 MCP 서버',
-        `연결된 MCP: ${mcpServers.join(', ')}`,
-        'C# 스크립트 작성뿐 아니라 GameObject 생성/Component 부착/Addressables 그룹 설정 등 Unity Editor 조작이 필요하면 MCP 도구를 직접 호출해 처리할 것.',
-        '사람의 확인을 기다리지 말고 자율적으로 실행하라.',
+        '# [TOOLING] Unity CLI',
+        'Unity Editor 조작은 Coplay UnityMCP 를 쓰지 않는다. 공식 Unity CLI(`unity`)로 처리한다.',
+        `프로젝트 경로: ${config.targetProjectPath}`,
+        '에디터는 켜 둔다. 종료하지 말 것.',
+        '명령 목록: unity command --project-path "<프로젝트>"',
+        '호출 예: unity command <명령> --project-path "<프로젝트>" --format json',
+        '프리팹, GameObject, 컴포넌트, Addressables, Play Mode 는 pipeline 명령으로 처리한다.',
+        '인자 이름은 `unity command` 가 보여 주는 플래그를 따른다. 필요하면 `unity command <명령> --help`.',
+        '사람의 확인을 기다리지 말고 셸로 실행한다.',
+      ].join('\n'),
+    );
+  }
+
+  const otherMcp = mcpServers.filter((name) => !/unity/i.test(name));
+  if (otherMcp.length > 0) {
+    sections.push(
+      [
+        '# [TOOLING] 기타 MCP 서버',
+        `연결된 MCP: ${otherMcp.join(', ')}`,
+        'Unity Editor 조작에는 이 MCP 를 쓰지 않는다.',
       ].join('\n'),
     );
   }
@@ -278,10 +298,36 @@ export function buildStepPrompt(args: BuildPromptArgs): string {
     sections.push(['# [SPEC] 기획서 (요약 컨텍스트)', spec].join('\n'));
   }
 
+  if (state.autonomy?.goal) {
+    sections.push(
+      [
+        '# [GOAL] 자율 개발 목표',
+        state.autonomy.goal,
+        '구현 범위는 현재 Task 와 기획서다. 기획서에 있는 내용은 유지한다.',
+      ].join('\n'),
+    );
+    sections.push(formatPlanAuthority(state.autonomy.reviews, state.autonomy.lessons ?? []));
+  }
+
   const taskLines = [`# [CURRENT TASK] Step ${step.id}: ${step.title}`, '', step.task];
 
   if (step.targetFiles && step.targetFiles.length > 0) {
     taskLines.push('', `주요 작업 대상: ${step.targetFiles.join(', ')}`);
+  }
+
+  if (step.playtest) {
+    taskLines.push(
+      '',
+      '## 이 Step 의 조작 검증',
+      `오케스트레이터가 Play Mode 에서 다음만 실행한다: ${step.playtest.input}`,
+      `입력 후 화면은 이래야 한다: ${step.playtest.expect}`,
+      step.playtest.failure ? `지난 실패: ${step.playtest.failure}` : '',
+      '다른 기능의 키가 아니라, 이 조작에 이 기능이 반응하게 구현하라.',
+      '기능이 일어나면 CursorAutoWork.PlaytestLog.Mark("이벤트이름") 를 호출하라.',
+      step.playtest.probe
+        ? `합격 측정: ${JSON.stringify(step.playtest.probe)}. 화면 설명만으로는 통과하지 않는다.`
+        : 'probe 가 없다. events, position, active, text 중 하나를 playtest.probe 에 넣어라. 없으면 통과하지 않는다.',
+    );
   }
 
   if (step.acceptanceCriteria && step.acceptanceCriteria.length > 0) {
@@ -313,7 +359,39 @@ export function buildStepPrompt(args: BuildPromptArgs): string {
     );
   }
 
-  sections.push(buildOutputContract(config.validationMode));
+  sections.push(buildOutputContract(config));
 
   return sections.join('\n\n---\n\n');
+}
+
+/** 같은 구현 세션을 이어 갈 때. 기획서 전문을 다시 붙이지 않는다. */
+export function buildContinuedStepPrompt(args: BuildPromptArgs): string {
+  const { config, state, step, feedback, attempt } = args;
+  const lines = [
+    '# [CONTINUE] 같은 구현 세션',
+    '이전 대화의 구현 세션을 이어 간다. 이미 한 작업을 처음부터 다시 하지 마라.',
+    '기획서나 규칙이 필요하면 파일을 직접 읽어라.',
+    '',
+    formatPlanAuthority(state.autonomy?.reviews ?? [], state.autonomy?.lessons ?? []),
+    '',
+    `# Step ${step.id}: ${step.title}`,
+    step.task,
+  ];
+  if (step.playtest) {
+    lines.push(
+      '',
+      `이 Step 조작: ${step.playtest.input}`,
+      `입력 후 화면: ${step.playtest.expect}`,
+      step.playtest.failure ? `지난 실패, 같은 이유로 반복하지 말 것: ${step.playtest.failure}` : '',
+    );
+  }
+  if (step.acceptanceCriteria && step.acceptanceCriteria.length > 0) {
+    lines.push('', '완료 조건:', ...step.acceptanceCriteria.map((item) => `- ${item}`));
+  }
+  lines.push('', `시도 ${attempt} / ${config.maxRetries}`);
+  if (feedback) {
+    lines.push('', '# 이번 시도에서 먼저 고칠 검수 실패', feedback);
+  }
+  lines.push('', 'git commit 은 하지 마라.');
+  return lines.join('\n');
 }

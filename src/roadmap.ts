@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 
-import type { Roadmap, RoadmapStep, VerifyCheck, VerifyCheckType, VerifyScope, VerifySpec } from './types';
+import { parseProbe } from './playtestProbe';
+import type { Roadmap, RoadmapStep, StepPlaytest, VerifyCheck, VerifyCheckType, VerifyScope, VerifySpec } from './types';
 
 export class RoadmapError extends Error {}
 
@@ -135,6 +136,24 @@ function parseCheck(raw: unknown, stepId: number, index: number): VerifyCheck {
   return check;
 }
 
+function parseStepPlaytest(raw: unknown, stepId: number): StepPlaytest | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new RoadmapError(`Step ${stepId}: 'playtest' 는 객체여야 합니다.`);
+  }
+  const rec = raw as Record<string, unknown>;
+  const input = typeof rec.input === 'string' ? rec.input.trim() : '';
+  const expect = typeof rec.expect === 'string' ? rec.expect.trim() : '';
+  if (!input || !expect) {
+    throw new RoadmapError(`Step ${stepId}: playtest 는 input 과 expect 문자열이 모두 필요합니다.`);
+  }
+  const failure = typeof rec.failure === 'string' && rec.failure.trim() ? rec.failure.trim() : undefined;
+  const history = Array.isArray(rec.history)
+    ? rec.history.filter((item): item is string => typeof item === 'string' && item.trim() !== '').map((item) => item.trim()).slice(-8)
+    : undefined;
+  return { input, expect, probe: parseProbe(rec.probe), failure, history: history && history.length > 0 ? history : undefined };
+}
+
 function parseVerify(raw: unknown, stepId: number): VerifySpec | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw !== 'object' || Array.isArray(raw)) {
@@ -216,6 +235,7 @@ export function loadRoadmap(roadmapPath: string): Roadmap {
       verify: parseVerify(step.verify, id),
       runTests: typeof step.runTests === 'boolean' ? step.runTests : undefined,
       commitMessage: typeof step.commitMessage === 'string' ? step.commitMessage : undefined,
+      playtest: parseStepPlaytest(step.playtest, id),
     };
   });
 

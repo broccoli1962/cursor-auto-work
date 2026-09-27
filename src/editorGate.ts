@@ -3,29 +3,23 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { createLogger } from './logger';
-import {
-  findUnityMcpEntry,
-  openMcpSession,
-  readUnityInstances,
-  type McpRpcSession,
-} from './mcpProbe';
 import { ABORT_MESSAGE, abortableSleep, throwIfAborted } from './processKill';
 import type { OrchestratorConfig } from './types';
 import {
-  formatMissingUnityTools,
-  resolveUnityTools,
-  toolNamesFromList,
-  type UnityToolRole,
-} from './unityTools';
+  detectPipeline,
+  editorLooksLive,
+  editorMatchesProject,
+  installPipelinePackage,
+  listConnectedEditors,
+  openProjectWithCli,
+  promptInstall,
+} from './unityCli';
 
 const log = createLogger('editor-gate');
 
 export interface EditorGateResult {
   ok: boolean;
   message: string;
-  instances: string[];
-  toolNames: string[];
-  tools: Partial<Record<UnityToolRole, string>>;
   launched: boolean;
 }
 
@@ -35,15 +29,15 @@ export function launchedUnityPid(): number | undefined {
   return launchedPid;
 }
 
-export function launchUnityEditor(config: OrchestratorConfig): { pid?: number; error?: string } {
+function launchUnityExecutable(config: OrchestratorConfig): { pid?: number; error?: string } {
   if (!config.unityPath) {
-    return { error: 'UNITY_PATH 가 없어 에디터를 자동 실행할 수 없습니다. 에디터를 연 뒤 다시 실행하세요.' };
+    return { error: 'UNITY_PATH 가 없어 Unity.exe 로 폴백할 수 없습니다.' };
   }
   if (!fs.existsSync(config.unityPath)) {
     return { error: `UNITY_PATH 실행 파일을 찾을 수 없습니다: ${config.unityPath}` };
   }
 
-  log.info(`Unity Editor 기동: ${config.unityPath}`);
+  log.info(`Unity Editor 기동 (UNITY_PATH): ${config.unityPath}`);
   try {
     const child = spawn(config.unityPath, ['-projectPath', config.targetProjectPath], {
       cwd: path.dirname(config.unityPath),
@@ -59,64 +53,53 @@ export function launchUnityEditor(config: OrchestratorConfig): { pid?: number; e
   }
 }
 
-async function inspectEditor(
+async function launchEditor(config: OrchestratorConfig, signal?: AbortSignal): Promise<{ ok: boolean; message: string }> {
+  log.info(`Unity Editor 기동: unity open ${config.targetProjectPath}`);
+  const opened = await openProjectWithCli(config, signal);
+  if (opened.ok) return opened;
+
+  log.warn(`${opened.message} UNITY_PATH 로 다시 띄웁니다.`);
+  const fallback = launchUnityExecutable(config);
+  if (fallback.error) return { ok: false, message: `${opened.message} ${fallback.error}` };
+  return { ok: true, message: 'UNITY_PATH 로 에디터를 띄웠습니다.' };
+}
+
+async function ensurePipeline(
   config: OrchestratorConfig,
-  timeoutMs: number,
   signal?: AbortSignal,
-): Promise<
-  Omit<EditorGateResult, 'launched' | 'ok' | 'message'> & { error?: string; hard?: boolean }
-> {
-  const entry = findUnityMcpEntry(config.targetProjectPath);
-  if (!entry) {
+): Promise<{ ok: boolean; message: string }> {
+  const installed = await detectPipeline(config, signal);
+  if (installed === true) return { ok: true, message: 'Unity Pipeline 연결됨' };
+  if (installed === undefined) {
+    log.warn('Pipeline 설치 여부를 확인하지 못했습니다. 컴파일 명령으로 다시 확인합니다.');
+    return { ok: true, message: 'Unity Editor 연결됨 (Pipeline 상태 불명)' };
+  }
+
+  const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  let confirmed = false;
+  if (config.unityPipelineInstall === 'ask' && interactive) {
+    confirmed = await promptInstall(
+      'Unity Pipeline 패키지(com.unity.pipeline)가 없습니다. `unity pipeline install` 을 실행할까요? [y/N] ',
+    );
+  }
+  const shouldInstall =
+    config.unityPipelineInstall === 'yes' || (config.unityPipelineInstall === 'ask' && interactive && confirmed);
+  if (!shouldInstall) {
     return {
-      instances: [],
-      toolNames: [],
-      tools: {},
-      hard: true,
-      error:
-        'UnityMCP 가 mcp.json 에 없습니다. 전역 ~/.cursor/mcp.json 또는 프로젝트 .cursor/mcp.json 에 등록하세요.',
+      ok: false,
+      message:
+        '열린 에디터에 Unity Pipeline 패키지가 없습니다. 프로젝트를 연 뒤 `unity pipeline install` 을 실행하거나 UNITY_PIPELINE_INSTALL=yes 로 두세요. Unity 6.0 이상이 필요합니다.',
     };
   }
 
-  let session: McpRpcSession | null = null;
-  try {
-    const opened = await openMcpSession(
-      entry,
-      timeoutMs,
-      config.targetProjectPath,
-      'cursor-auto-work-gate',
-      signal,
-    );
-    session = opened.session;
-    const listed = await session.request('tools/list');
-    const toolNames = toolNamesFromList(listed);
-    const { resolved, missingRequired } = resolveUnityTools(toolNames);
-    const instances = await readUnityInstances(session).catch(() => []);
-    if (missingRequired.length > 0) {
-      return {
-        instances,
-        toolNames,
-        tools: resolved,
-        hard: true,
-        error: formatMissingUnityTools(missingRequired, toolNames),
-      };
-    }
-    return { instances, toolNames, tools: resolved };
-  } catch (error) {
-    return {
-      instances: [],
-      toolNames: [],
-      tools: {},
-      error: `UnityMCP 에 연결하지 못했습니다: ${(error as Error).message}`,
-    };
-  } finally {
-    await session?.close();
-  }
+  const install = await installPipelinePackage(config, signal);
+  if (!install.ok) return install;
+  return { ok: true, message: install.message };
 }
 
 /**
- * compile/full(mcp) 실행 전 에디터+UnityMCP 가 살아 있는지 확인한다.
- * 인스턴스가 없고 UNITY_LAUNCH_EDITOR 이면 에디터를 띄운 뒤 대기한다.
+ * compile/full(cli) 실행 전 공식 Unity CLI 와 열린 에디터가 준비됐는지 확인한다.
+ * 인스턴스가 없고 UNITY_LAUNCH_EDITOR 이면 `unity open` 으로 띄운 뒤 대기한다.
  */
 export async function ensureLiveEditor(
   config: OrchestratorConfig,
@@ -126,73 +109,57 @@ export async function ensureLiveEditor(
   const waitMs = Math.max(config.unityLaunchTimeoutMs, 10_000);
   const started = Date.now();
   let launched = false;
-  let lastError = '';
+  let lastError = 'Unity Editor 가 Unity CLI 에 연결되어 있지 않습니다.';
 
   while (Date.now() - started < waitMs) {
     throwIfAborted(signal, ABORT_MESSAGE);
-    const inspect = await inspectEditor(config, Math.min(20_000, waitMs), signal);
-    if (inspect.hard && inspect.error) {
-      return {
-        ok: false,
-        message: inspect.error,
-        instances: inspect.instances,
-        toolNames: inspect.toolNames,
-        tools: inspect.tools,
-        launched,
-      };
+    let editors: Awaited<ReturnType<typeof listConnectedEditors>> = [];
+    try {
+      editors = await listConnectedEditors(config, signal);
+    } catch (error) {
+      lastError = (error as Error).message;
+      if (!config.unityLaunchEditor) {
+        return { ok: false, message: lastError, launched };
+      }
     }
 
-    if (inspect.instances.length > 0 && !inspect.error) {
-      return {
-        ok: true,
-        message: `Unity Editor 연결됨 (${inspect.instances.join(', ')})`,
-        instances: inspect.instances,
-        toolNames: inspect.toolNames,
-        tools: inspect.tools,
-        launched,
-      };
+    const live = editors.find(
+      (editor) => editorMatchesProject(editor, config.targetProjectPath) && editorLooksLive(editor),
+    );
+    if (live) {
+      const pipeline = await ensurePipeline(config, signal);
+      if (!pipeline.ok) return { ok: false, message: pipeline.message, launched };
+      const label = live.port ? `${live.projectPath} :${live.port}` : live.projectPath;
+      return { ok: true, message: `${pipeline.message} (${label})`, launched };
     }
 
-    lastError =
-      inspect.error ??
-      'Unity Editor 가 UnityMCP 에 연결되어 있지 않습니다. 대상 프로젝트를 에디터로 연 채로 실행하세요.';
+    if (editors.length > 0) {
+      lastError = `열린 에디터가 대상 프로젝트가 아닙니다: ${editors.map((editor) => editor.projectPath).join(', ')}`;
+    } else {
+      lastError = 'Unity Editor 가 떠 있지 않습니다. 대상 프로젝트를 연 채로 실행하세요.';
+    }
 
     if (!config.unityLaunchEditor) {
       return {
         ok: false,
         message: `${lastError} (자동 기동은 UNITY_LAUNCH_EDITOR=false 로 꺼져 있습니다.)`,
-        instances: inspect.instances,
-        toolNames: inspect.toolNames,
-        tools: inspect.tools,
         launched: false,
       };
     }
 
-    if (config.unityLaunchEditor && !launched) {
-      const launch = launchUnityEditor(config);
-      if (launch.error) {
-        return {
-          ok: false,
-          message: `${lastError} ${launch.error}`,
-          instances: inspect.instances,
-          toolNames: inspect.toolNames,
-          tools: inspect.tools,
-          launched: false,
-        };
-      }
+    if (!launched) {
+      const launch = await launchEditor(config, signal);
+      if (!launch.ok) return { ok: false, message: `${lastError} ${launch.message}`, launched: false };
       launched = true;
-      log.info(`에디터 기동 후 UnityMCP 접속을 기다립니다 (최대 ${Math.round(waitMs / 1000)}초)...`);
+      log.info(`에디터 기동 후 Unity CLI 접속을 기다립니다 (최대 ${Math.round(waitMs / 1000)}초)...`);
     }
 
-    await abortableSleep(3000, signal);
+    await abortableSleep(3_000, signal);
   }
 
   return {
     ok: false,
     message: `${lastError} (${Math.round(waitMs / 1000)}초 대기 후에도 인스턴스가 없습니다.)`,
-    instances: [],
-    toolNames: [],
-    tools: {},
     launched,
   };
 }

@@ -2,18 +2,20 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { docsReadyForAutonomy, ensureGoalDocs, readDoc, resolveAutonomyGoal } from './autonomy';
+import { loadRoadmap, RoadmapError } from './roadmap';
 import { describeValidationMode, ensureRuntimeDirs, loadConfig, needsUnity, validateConfig } from './config';
 import type { ValidationIssue } from './config';
 import { parseArgs, type ParsedArgs } from './cliArgs';
 import { collectCursorRules, probeCursorAgent, probeCursorAuth } from './cursorRunner';
 import { ensureLiveEditor } from './editorGate';
+import { ensureUnityCli } from './unityCli';
 import { enableUtf8Console } from './encoding';
 import { closeLogger, configureLogger, createLogger } from './logger';
 import { formatProbeResult, loadMcpServers, probeMcpServers } from './mcpProbe';
 import type { McpProbeResult } from './mcpProbe';
 import { buildStepPrompt, loadState } from './memoryManager';
 import { Orchestrator, selectPreviewSteps } from './orchestrator';
-import { loadRoadmap } from './roadmap';
 import { acquireRunLock, RunLockError } from './runLock';
 import type { OrchestratorConfig, ValidationMode } from './types';
 
@@ -47,7 +49,8 @@ Unity & Cursor Headless CLI 오케스트레이터
   cursor-auto-work [options] <command>
 
 Commands:
-  run              roadmap.json 기준으로 파이프라인을 실행합니다 (기본값)
+  run              기획·개발·검토·기획 수정을 반복합니다 (기본값)
+                   AUTONOMY=false 또는 --no-autonomy 이면 로드맵만 실행합니다
   preview-prompt   Agent 를 실행하지 않고 Step 프롬프트만 출력합니다 (state 변경 없음)
   init             대상 프로젝트에 docs/spec.md, docs/roadmap.json 템플릿을 생성합니다
   status           state.json 기반 진행 상황을 출력합니다
@@ -70,17 +73,26 @@ Options:
   --no-judge             완료 조건 판정 Agent 끄기
   --no-launch-editor     에디터 자동 기동 끄기
   --no-resume            재시도 시 세션 resume 끄기
+  --install-unity-cli    Unity CLI 가 없으면 묻지 않고 설치
+  --no-install-unity-cli Unity CLI 설치 질문을 끄고, 없으면 안내만 출력
+  --goal <주제>          개발 주제. GOAL 환경 변수보다 우선. 있으면 기획서와 로드맵을 그 주제에 맞게 다시 씀
+  --cycles <n>           자율 루프 최대 사이클 (AUTONOMY_MAX_CYCLES, 기본 3)
+  --autonomy             AUTONOMY=false 여도 이번 실행은 자율 사이클을 켭니다
+  --no-autonomy          이번 실행은 로드맵만 실행합니다
 
 검수 모드 (VALIDATION_MODE):
   lint     Verify 체크 + 이번 Step delta 린트
-  compile  lint + 열린 Unity Editor(MCP) 컴파일 (기본값)
+  compile  lint + 열린 Unity Editor(Unity CLI) 컴파일 (기본값)
   full     lint + 에디터 컴파일 + EditMode 테스트 (roadmap step.runTests=true 일 때)
   skip     검수 생략 (diff 수집만)
 
-  compile/full 은 에디터를 끄지 않습니다. 구 배치모드는 UNITY_VALIDATION_BACKEND=batch
+  compile/full 은 공식 Unity CLI 로 열린 에디터를 검수합니다. 에디터를 끄지 않습니다.
+  unity 가 없으면 설치 여부를 묻고, --install-unity-cli 이면 바로 설치합니다.
+  구 배치모드는 UNITY_VALIDATION_BACKEND=batch
 
   예시:
   cursor-auto-work run --project D:\\UnityProjects\\MyGame
+  cursor-auto-work run --goal "한 판짜리 2D 로그라이크"
   cursor-auto-work --project D:\\UnityProjects\\MyGame run
   cursor-auto-work run --validation full
   cursor-auto-work preview-prompt --to 1
@@ -103,6 +115,11 @@ function buildConfig(flags: ParsedArgs['flags']): OrchestratorConfig {
   if (flags['no-judge'] === true) overrides.stepJudge = false;
   if (flags['no-launch-editor'] === true) overrides.unityLaunchEditor = false;
   if (flags['no-resume'] === true) overrides.resumeOnRetry = false;
+  if (flags.autonomy === true) overrides.autonomyEnabled = true;
+  if (flags['no-autonomy'] === true) overrides.autonomyEnabled = false;
+  if (typeof flags.goal === 'string') overrides.goal = flags.goal.trim();
+  if (flags['install-unity-cli'] === true) overrides.unityCliInstall = 'yes';
+  if (flags['no-install-unity-cli'] === true) overrides.unityCliInstall = 'no';
   if (flags.debug === true) overrides.logLevel = 'debug';
 
   return loadConfig(overrides);
@@ -207,6 +224,16 @@ function commandStatus(config: OrchestratorConfig): void {
     '',
   ];
 
+  if (state.autonomy) {
+    const last = state.autonomy.reviews[state.autonomy.reviews.length - 1];
+    lines.splice(
+      4,
+      0,
+      `목표: ${state.autonomy.goal}`,
+      `자율 사이클: ${state.autonomy.cycle}/${state.autonomy.maxCycles}${last ? ` (최근 검토 ${last.verdict})` : ''}`,
+    );
+  }
+
   for (const step of roadmap.steps) {
     const done = state.completedSteps.includes(step.id);
     const current = state.currentStepId === step.id && !done;
@@ -261,7 +288,7 @@ function mcpIssues(results: McpProbeResult[]): ValidationIssue[] {
     issues.push({
       fatal: false,
       message:
-        'mcp.json 에 등록된 MCP 서버가 없습니다 - Agent 가 Unity Editor 를 직접 조작할 수 없습니다.',
+        'mcp.json 에 등록된 MCP 서버가 없습니다. Unity Editor 조작은 공식 Unity CLI 를 사용합니다.',
     });
     return issues;
   }
@@ -290,6 +317,14 @@ async function commandDoctor(
   const servers = loadMcpServers(config.targetProjectPath);
   const skipProbe = flags['no-mcp-probe'] === true;
 
+  const cliRequired = needsUnity(config) && config.unityValidationBackend === 'cli';
+  const unityCli = await ensureUnityCli(config, { required: cliRequired });
+  if (!unityCli.ok) {
+    issues.push({ fatal: true, message: unityCli.message });
+  } else if (unityCli.missing) {
+    issues.push({ fatal: false, message: unityCli.message });
+  }
+
   const agentProbe = await probeCursorAgent(config);
   if (!agentProbe.ok) {
     issues.push({
@@ -313,21 +348,26 @@ async function commandDoctor(
     '=== 환경 점검 ===',
     `대상 프로젝트   : ${config.targetProjectPath}`,
     `Unity 실행 파일 : ${config.unityPath || '(미설정)'}`,
+    `Unity CLI        : ${unityCli.version ?? unityCli.message}`,
     `agent (CLI)     : ${config.cursorAgentBin}${config.cursorYolo ? ' (--force 자동 승인)' : ''}`,
     `  └ 실행 확인   : ${agentProbe.ok ? agentProbe.version : `실패 - ${agentProbe.error}`}`,
     `  └ 인증        : ${authProbe.checked ? (authProbe.ok ? authProbe.detail : `실패 - ${authProbe.detail}`) : authProbe.detail}`,
     `모델            : ${config.cursorModel || '(CLI 기본값)'}`,
     `프롬프트 전달   : ${config.promptDelivery}`,
     `검수 모드       : ${config.validationMode} (${describeValidationMode(config)})`,
-    `Unity 검수 채널 : ${config.unityValidationBackend === 'batch' ? 'batch (에디터 종료)' : 'mcp (열린 에디터)'}`,
+    `Unity 검수 채널 : ${config.unityValidationBackend === 'batch' ? 'batch (에디터 종료)' : 'cli (열린 에디터)'}`,
     `에디터 자동 기동 : ${config.unityLaunchEditor ? '활성' : '비활성'}`,
     `자동 커밋       : ${config.autoCommit ? '활성' : '비활성'}`,
     `자동 푸시       : ${config.autoPush ? '활성 (force 없음)' : '비활성'}`,
     `커밋 언어       : ${config.commitLanguage}`,
     `재시도 resume   : ${config.resumeOnRetry ? '활성' : '비활성'}`,
+    `구현 세션 유지  : ${config.autonomyResumeSession ? '활성 (검토는 새 세션)' : '비활성'}`,
     `실패 롤백       : ${config.rollbackOnFail ? '활성' : '비활성'}`,
     `verify 추론     : ${config.inferVerify ? '활성 (로드맵을 고치지 않음)' : '비활성'}`,
     `완료 조건 판정  : ${config.stepJudge ? `활성 (${config.judgeTimeoutMs}ms)` : '비활성'}`,
+    `자율 개발       : ${config.autonomyEnabled ? `활성 (예산 ${config.autonomyBudgetMs}ms, 최대 ${config.autonomyMaxCycles}사이클, 사이클당 Step ${config.autonomyStepsPerCycle}개)` : '비활성 (로드맵만)'}`,
+    `화면 검증       : ${config.playtest ? `활성 (재생 후 ${config.playtestSettleMs}ms, 조작은 Step.playtest)` : '꺼짐'}`,
+    `개발 주제       : ${config.goal || `(없음 — ${config.goalPath} 또는 기획서)`}`,
     `기획서          : ${config.specPath}`,
     `로드맵          : ${config.roadmapPath}`,
     `상태 파일       : ${config.statePath}`,
@@ -364,7 +404,46 @@ async function commandDoctor(
   return issues.some((issue) => issue.fatal) ? 1 : 0;
 }
 
+function readGoalFile(config: OrchestratorConfig): string {
+  if (!fs.existsSync(config.goalPath)) return '';
+  return readDoc(config.goalPath).trim();
+}
+
+function projectDocsReady(config: OrchestratorConfig): boolean {
+  let roadmap = null;
+  try {
+    if (fs.existsSync(config.roadmapPath)) roadmap = loadRoadmap(config.roadmapPath);
+  } catch (error) {
+    if (!(error instanceof RoadmapError)) throw error;
+    return false;
+  }
+  return docsReadyForAutonomy(readDoc(config.specPath), roadmap);
+}
+
 async function commandRun(config: OrchestratorConfig, flags: ParsedArgs['flags']): Promise<number> {
+  if (flags.goal === true) {
+    log.error('--goal 뒤에 개발 주제를 적으세요. 예: --goal "한 판짜리 2D 로그라이크"');
+    return 1;
+  }
+  const autonomy = resolveAutonomyGoal({
+    enabled: config.autonomyEnabled,
+    configuredGoal: config.goal,
+    fileGoal: config.autonomyEnabled ? readGoalFile(config) : '',
+    projectName: path.basename(config.targetProjectPath),
+    docsReady: projectDocsReady(config),
+  });
+  if (!autonomy.enabled && flags.cycles !== undefined) {
+    log.warn('--cycles 는 AUTONOMY 가 켜져 있을 때만 적용됩니다.');
+  }
+  if (autonomy.enabled && fs.existsSync(config.targetProjectPath)) {
+    ensureGoalDocs({
+      specPath: config.specPath,
+      roadmapPath: config.roadmapPath,
+      goal: autonomy.goal,
+      projectName: path.basename(config.targetProjectPath),
+    });
+  }
+
   const issues = validateConfig(config);
   for (const issue of issues) {
     if (issue.fatal) log.error(issue.message);
@@ -398,22 +477,21 @@ async function commandRun(config: OrchestratorConfig, flags: ParsedArgs['flags']
         else if (result.warning) log.warn(`MCP '${result.name}': ${result.warning}`);
         else log.info(`MCP '${result.name}' 정상 (도구 ${result.toolCount ?? 0}개)`);
       }
-
-      if (needsUnity(config) && config.unityValidationBackend === 'mcp') {
-        const unity = results.find((item) => /unity/i.test(item.name));
-        if (unity && !unity.ok && !unity.skipped) {
-          log.error(`UnityMCP 가 응답하지 않습니다: ${unity.error ?? '알 수 없는 실패'}`);
-          log.error('Agent 를 시작하지 않습니다. 에디터와 UnityMCP 를 확인하세요.');
-          return 1;
-        }
-      }
     }
 
-    if (needsUnity(config) && config.unityValidationBackend === 'mcp') {
+    if (needsUnity(config) && config.unityValidationBackend === 'cli') {
+      const unityCli = await ensureUnityCli(config, { required: true });
+      if (!unityCli.ok) {
+        log.error(unityCli.message);
+        log.error('Unity CLI 가 없어 Agent 를 시작하지 않습니다.');
+        return 1;
+      }
+      log.info(unityCli.message);
+
       const gate = await ensureLiveEditor(config);
       if (!gate.ok) {
         log.error(gate.message);
-        log.error('에디터/UnityMCP 가 준비되지 않아 Agent 를 시작하지 않습니다.');
+        log.error('에디터/Unity CLI 가 준비되지 않아 Agent 를 시작하지 않습니다.');
         return 1;
       }
       log.info(gate.message);
@@ -426,6 +504,20 @@ async function commandRun(config: OrchestratorConfig, flags: ParsedArgs['flags']
     process.on('SIGTERM', onSignal);
 
     try {
+      if (autonomy.enabled) {
+        const requestedCycles = numberFlag(flags, 'cycles');
+        await orchestrator.runAutonomous({
+          goal: autonomy.goal,
+          replan: autonomy.replan,
+          fromStep: numberFlag(flags, 'from'),
+          toStep: numberFlag(flags, 'to'),
+          forceRerun: flags['force-rerun'] === true,
+          maxCycles: requestedCycles !== undefined && requestedCycles >= 1 ? requestedCycles : undefined,
+        });
+        if (orchestrator.wasAborted()) return 130;
+        return orchestrator.needsHuman() ? 1 : 0;
+      }
+
       await orchestrator.run({
         fromStep: numberFlag(flags, 'from'),
         toStep: numberFlag(flags, 'to'),

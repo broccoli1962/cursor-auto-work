@@ -8,14 +8,17 @@ export type CommitLanguage = 'ko' | 'en';
 /**
  * 검수 파이프라인 프리셋.
  * - `lint`    : Git Diff + 컨벤션 린트
- * - `compile` : lint + Unity Editor(MCP) 컴파일 (기본값)
+ * - `compile` : lint + 열린 Unity Editor(Unity CLI) 컴파일 (기본값)
  * - `full`    : lint + 컴파일 + EditMode 테스트 (roadmap step.runTests=true 일 때)
  * - `skip`    : 검수 생략 (diff 수집만, 실패 없음)
  */
 export type ValidationMode = 'lint' | 'compile' | 'full' | 'skip';
 
 /** compile/full 에서 Unity 를 검사하는 채널 */
-export type UnityValidationBackend = 'mcp' | 'batch';
+export type UnityValidationBackend = 'cli' | 'batch';
+
+/** Unity CLI / Pipeline 패키지가 없을 때 설치 정책 */
+export type UnityInstallMode = 'ask' | 'yes' | 'no';
 
 /**
  * 프롬프트를 agent CLI 에 전달하는 방식.
@@ -29,8 +32,14 @@ export type PromptDelivery = 'auto' | 'argv' | 'stdin' | 'file';
 export interface OrchestratorConfig {
   /** Unity 프로젝트 루트 (Assets/, ProjectSettings/ 위치) */
   targetProjectPath: string;
-  /** Unity Editor 실행 파일 경로 */
+  /** Unity Editor 실행 파일 경로. batch 채널과 CLI 기동 실패 시 폴백 */
   unityPath: string;
+  /** 공식 Unity CLI 실행 파일. PATH 에 있으면 `unity` */
+  unityCliBin: string;
+  /** `unity` 가 없을 때 설치 여부. ask 는 TTY 에서만 질문 */
+  unityCliInstall: UnityInstallMode;
+  /** com.unity.pipeline 가 없을 때 설치 여부 */
+  unityPipelineInstall: UnityInstallMode;
   /** agent CLI 실행 커맨드 (공식 Cursor CLI) */
   cursorAgentBin: string;
   /** 사용할 모델 (빈 값이면 CLI 기본값) */
@@ -41,9 +50,9 @@ export interface OrchestratorConfig {
   promptDelivery: PromptDelivery;
   /** 검수 파이프라인 프리셋 */
   validationMode: ValidationMode;
-  /** compile/full 검수 채널. 기본 mcp (에디터 유지). batch 는 에디터를 종료함 */
+  /** compile/full 검수 채널. 기본 cli (에디터 유지). batch 는 에디터를 종료함 */
   unityValidationBackend: UnityValidationBackend;
-  /** 인스턴스가 없으면 UNITY_PATH 로 에디터를 띄운다 */
+  /** 인스턴스가 없으면 `unity open` 으로 에디터를 띄운다 */
   unityLaunchEditor: boolean;
   /** 에디터 기동/접속 대기 (ms) */
   unityLaunchTimeoutMs: number;
@@ -69,8 +78,32 @@ export interface OrchestratorConfig {
   /** acceptanceCriteria 판정 Agent */
   stepJudge: boolean;
   judgeTimeoutMs: number;
+  /** 기획 → 개발 → 검토 → 기획 수정 사이클. 기본 켜짐 */
+  autonomyEnabled: boolean;
+  /** 개발 주제. 비어 있으면 기획서를 목표로 본다 */
+  goal: string;
+  /** 주제 파일. goal 이 비어 있고 파일이 있으면 그 내용을 주제로 쓴다 */
+  goalPath: string;
+  /** 자율 루프가 기획을 고치고 다시 개발하는 최대 횟수. 시간 예산이 먼저 끝나면 멈춘다 */
+  autonomyMaxCycles: number;
+  /** 계획을 따라가며 스스로 고치는 시간 예산 (ms) */
+  autonomyBudgetMs: number;
+  /** 한 번 검토하기 전에 실행할 Step 수. 1이면 매 Step 뒤에 계획을 다시 본다 */
+  autonomyStepsPerCycle: number;
+  /** Play Mode 로 들어가 Game 뷰를 찍어 검토에 넘긴다 */
+  playtest: boolean;
+  /** 재생 후 화면을 찍기 전에 기다리는 시간 (ms) */
+  playtestSettleMs: number;
+  /** 목표 대비 기획 검토 Agent 타임아웃 (ms) */
+  autonomyReviewTimeoutMs: number;
   /** 검수 실패 재시도 시 직전 세션 resume */
   resumeOnRetry: boolean;
+  /** 자율 개발에서 구현 세션을 Step 너머로 이어 간다. 검토 세션은 항상 새로 연다 */
+  autonomyResumeSession: boolean;
+  /** 구현 세션을 이 횟수만큼 쓴 뒤, 최근 검토를 심고 새 세션을 연다 */
+  autonomySessionSteps: number;
+  /** 기대 화면과 다를 때, 구현 세션이 고치고 다시 조작하는 횟수 */
+  playtestRetries: number;
   /** 재시도 소진 시 이번 Step delta 만 되돌림 (시작 당시 dirty 는 유지) */
   rollbackOnFail: boolean;
   /** run 시작 시 auto-work/* 작업 브랜치 생성 */
@@ -106,6 +139,76 @@ export interface RoadmapStep {
   runTests?: boolean;
   /** 이 Step 전용 커밋 메시지 (미지정 시 기본 포맷) */
   commitMessage?: string;
+  /** 이 기능만 시험하는 조작과, 입력 후 화면에서 보여야 하는 결과. 없으면 키/마우스를 넣지 않는다 */
+  playtest?: StepPlaytest;
+}
+
+export interface ProbePositionCheck {
+  object: string;
+  axis: 'x' | 'y' | 'z';
+  /** 입력 이후 정점과 입력 전 기준의 차이 */
+  deltaMin?: number;
+  deltaMax?: number;
+}
+
+/** 합격은 이 측정이다. expect 문장이나 스크린샷 설명으로는 통과하지 않는다. */
+export interface PlaytestProbe {
+  /** 입력 뒤에 이 순서대로 남아 있어야 한다. 입력 전에 이미 있으면 실패 */
+  events?: string[];
+  /** 오브젝트 하나의 정점 이동 */
+  position?: ProbePositionCheck;
+  /** 여러 오브젝트·축 */
+  positions?: ProbePositionCheck[];
+  /** 입력 뒤 활성 상태. 입력 전에 이미 같으면 실패 */
+  active?: { object: string; equals: boolean };
+  actives?: { object: string; equals: boolean }[];
+  /** UI 글자. 입력 전에 이미 포함되어 있으면 실패 */
+  text?: { object: string; contains: string };
+  texts?: { object: string; contains: string }[];
+}
+
+export interface ProbeInstance {
+  id: number;
+  active: boolean;
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface ProbeObjectState {
+  found: boolean;
+  active: boolean;
+  x: number;
+  y: number;
+  z: number;
+  /** 같은 이름과 (Clone) 복제. 풀에서 꺼져 있어도 남는다 */
+  instances?: ProbeInstance[];
+}
+
+export interface ProbeTextState {
+  found: boolean;
+  text: string;
+  instances?: { id: number; text: string }[];
+}
+
+export interface ProbeSample {
+  events: string[];
+  position?: { found: boolean; x: number; y: number; z: number };
+  objects: Record<string, ProbeObjectState>;
+  texts: Record<string, ProbeTextState>;
+}
+
+/** 한 Step 의 플레이 검증. 전역 키 입력이 아니라 이 기능의 조작이다 */
+export interface StepPlaytest {
+  /** click:x,y / key:Name[:down|up|press] / move:x,y / wait:ms */
+  input: string;
+  /** 사람에게 보여주는 설명. 합격 조건은 probe */
+  expect: string;
+  probe?: PlaytestProbe;
+  /** 마지막 조작 검증이 기대와 달랐던 이유. 맞으면 지운다 */
+  failure?: string;
+  /** 이 기능에서 실패한 시도와 버린 접근. 세션이 바뀌어도 남는다 */
+  history?: string[];
 }
 
 /** 린트·requireChanges·커밋에 쓰는 경로 범위 */
@@ -201,6 +304,32 @@ export type StepStatus =
   | 'needs_human'
   | 'paused';
 
+/** 자율 루프가 목표 대비 산출물을 본 뒤 내리는 판정 */
+export type AutonomyVerdict = 'done' | 'revise' | 'blocked';
+
+export interface AutonomyReviewRecord {
+  cycle: number;
+  verdict: AutonomyVerdict;
+  summary: string;
+  at: string;
+}
+
+/** 주제 하나로 기획·개발·검토·기획 수정을 반복하는 상태 */
+export interface AutonomyState {
+  goal: string;
+  cycle: number;
+  maxCycles: number;
+  /** 이번 목표로 기획서와 로드맵을 한 번 작성했는지 */
+  planned: boolean;
+  reviews: AutonomyReviewRecord[];
+  /** 구현 Agent 세션. Step 과 화면 확인 뒤에 `--resume` 으로 이어 간다 */
+  implementSessionId?: string;
+  /** 이 구현 세션으로 진행한 Step 수. 한도를 넘으면 검토 기록을 남기고 세션만 새로 연다 */
+  implementSessionSteps?: number;
+  /** 구현 대화에서 꺼낸 실패·버린 시도. 검토와 다음 Step 이 이 목록을 본다 */
+  lessons?: string[];
+}
+
 /** 완료된 Step 의 압축 요약 (Fresh Context 주입용) */
 export interface StepMemory {
   stepId: number;
@@ -227,6 +356,8 @@ export interface OrchestratorState {
   updatedAt: string;
   workBranch?: string;
   usage?: UsageTotals;
+  /** `--goal` 로 시작한 자율 개발. 없으면 로드맵만 실행한다. */
+  autonomy?: AutonomyState;
 }
 
 /** agent CLI --output-format stream-json 이벤트의 느슨한 표현 */

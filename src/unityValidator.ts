@@ -12,16 +12,14 @@ import type {
   UnityCompileResult,
   UnityTestResult,
 } from './types';
-import { ABORT_MESSAGE, isAbortError, killChildTree, throwIfAborted } from './processKill';
+import { ABORT_MESSAGE, abortableSleep, isAbortError, killChildTree, throwIfAborted } from './processKill';
 import {
-  callUnityRole,
-  clearConsole,
-  readConsoleErrors,
-  requestLiveCompile,
-  restorePlayModeIfNeeded,
-  stopPlayModeIfNeeded,
-  withUnityEditor,
-} from './unityMcp';
+  isTransientCliError,
+  parseEditorPlaying,
+  parsePipelineTest,
+  unityCommand,
+  waitForRecompile,
+} from './unityCli';
 
 const log = createLogger('unity');
 
@@ -243,49 +241,85 @@ export async function runUnityCompile(
   signal?: AbortSignal,
 ): Promise<UnityCompileResult> {
   if (config.unityValidationBackend === 'batch') return runUnityCompileBatch(config, signal);
-  return runUnityCompileMcp(config, signal);
+  return runUnityCompileCli(config, signal);
 }
 
-async function runUnityCompileMcp(
+async function stopPlayModeCli(config: OrchestratorConfig, signal?: AbortSignal): Promise<boolean> {
+  const status = await unityCommand(config, 'editor_status', [], { timeoutMs: 30_000, signal });
+  const playing = parseEditorPlaying(status.payload);
+  if (!playing) return false;
+  if (!config.unityStopPlayMode) {
+    throw new Error(
+      'Unity Editor 가 Play Mode 입니다. 검수를 위해 재생을 끄거나 UNITY_STOP_PLAY_MODE=true 로 두세요.',
+    );
+  }
+  log.warn('Play Mode 가 켜져 있어 검수 전에 중지합니다. 검수 후 다시 재생합니다.');
+  await unityCommand(config, 'editor_stop', [], { timeoutMs: 30_000, signal });
+  return true;
+}
+
+async function restorePlayModeCli(
+  config: OrchestratorConfig,
+  wasPlaying: boolean,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!wasPlaying || !config.unityRestorePlayMode) return;
+  try {
+    await unityCommand(config, 'editor_play', [], { timeoutMs: 30_000, signal });
+    log.info('검수 전 Play Mode 를 복구했습니다.');
+  } catch (error) {
+    if (isAbortError(error)) throw error;
+    log.warn(`Play Mode 복구 실패(무시): ${(error as Error).message}`);
+  }
+}
+
+async function runUnityCompileCli(
   config: OrchestratorConfig,
   signal?: AbortSignal,
 ): Promise<UnityCompileResult> {
   const logPath = path.join(config.logsDir, 'unity_build.log');
-  log.info('Unity Editor(MCP) 컴파일 검수 시작...');
+  log.info('Unity CLI 컴파일 검수 시작...');
 
   try {
     throwIfAborted(signal, ABORT_MESSAGE);
-    return await withUnityEditor(
-      config,
-      async (session) => {
-        const wasPlaying = await stopPlayModeIfNeeded(session, config);
-        try {
-          try {
-            await clearConsole(session);
-          } catch (error) {
-            if (isAbortError(error)) throw error;
-            log.debug(`콘솔 clear 실패(무시): ${(error as Error).message}`);
-          }
+    const wasPlaying = await stopPlayModeCli(config, signal);
+    try {
+      try {
+        await unityCommand(config, 'clear_console', [], { timeoutMs: 30_000, signal });
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        log.debug(`콘솔 clear 실패(무시): ${(error as Error).message}`);
+      }
 
-          await requestLiveCompile(session, config.unityTimeoutMs, signal);
-          const payload = await readConsoleErrors(session);
-          const text = extractConsoleText(payload);
-          writeLog(logPath, text);
-          const errors = parseCompileErrors(text);
+      try {
+        await unityCommand(config, 'recompile', [], { timeoutMs: 60_000, signal });
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        if (!isTransientCliError(error)) throw error;
+        log.warn(`recompile 호출이 도메인 리로드로 끊겼을 수 있습니다: ${(error as Error).message}`);
+      }
 
-          if (errors.length > 0) {
-            log.warn(`C# 컴파일 에러 ${errors.length}건 감지 (Editor 콘솔)`);
-            return { ok: false, errors, logPath, exitCode: 0, timedOut: false };
-          }
+      await waitForRecompile(config, config.unityTimeoutMs, signal);
+      const logs = await unityCommand(
+        config,
+        'get_console_logs',
+        ['--severity', 'error', '--limit', '200'],
+        { timeoutMs: 60_000, signal },
+      );
+      const text = extractConsoleText(logs.payload ?? logs.stdout);
+      writeLog(logPath, text);
+      const errors = parseCompileErrors(text);
 
-          log.info('컴파일 검수 통과 (Unity Editor / MCP)');
-          return { ok: true, errors: [], logPath, exitCode: 0, timedOut: false };
-        } finally {
-          await restorePlayModeIfNeeded(session, wasPlaying, config);
-        }
-      },
-      signal,
-    );
+      if (errors.length > 0) {
+        log.warn(`C# 컴파일 에러 ${errors.length}건 감지 (Unity CLI 콘솔)`);
+        return { ok: false, errors, logPath, exitCode: 0, timedOut: false };
+      }
+
+      log.info('컴파일 검수 통과 (Unity CLI)');
+      return { ok: true, errors: [], logPath, exitCode: 0, timedOut: false };
+    } finally {
+      await restorePlayModeCli(config, wasPlaying, signal);
+    }
   } catch (error) {
     const message = (error as Error).message;
     writeLog(logPath, message);
@@ -294,7 +328,7 @@ async function runUnityCompileMcp(
       errors: [],
       logPath,
       exitCode: null,
-      timedOut: !isAbortError(error) && /내에 응답|timeout|타임아웃/i.test(message),
+      timedOut: !isAbortError(error) && /내에 끝나지|timeout|타임아웃/i.test(message),
       failureReason: message,
       aborted: isAbortError(error),
     };
@@ -303,7 +337,7 @@ async function runUnityCompileMcp(
 
 /**
  * Unity 를 배치모드로 기동해 C# 스크립트를 컴파일한다.
- * 에디터를 끄므로 UnityMCP 와 함께 쓰지 말 것. UNITY_VALIDATION_BACKEND=batch 전용.
+ * 에디터를 끄므로 열린 에디터 검수와 함께 쓰지 말 것. UNITY_VALIDATION_BACKEND=batch 전용.
  */
 async function runUnityCompileBatch(
   config: OrchestratorConfig,
@@ -448,91 +482,70 @@ export async function runUnityTests(
 ): Promise<UnityTestResult> {
   if (!enabled) return skippedTestResult();
   if (config.unityValidationBackend === 'batch') return runUnityTestsBatch(config, signal);
-  return runUnityTestsMcp(config, signal);
+  return runUnityTestsCli(config, signal);
 }
 
-function pickJobId(payload: unknown): string | undefined {
-  if (!payload || typeof payload !== 'object') return undefined;
-  const rec = payload as Record<string, unknown>;
-  const data = rec.data && typeof rec.data === 'object' ? (rec.data as Record<string, unknown>) : rec;
-  const id = data.job_id ?? data.jobId ?? rec.job_id ?? rec.jobId;
-  return typeof id === 'string' && id ? id : undefined;
-}
-
-async function runUnityTestsMcp(
+async function runUnityTestsCli(
   config: OrchestratorConfig,
   signal?: AbortSignal,
 ): Promise<UnityTestResult> {
   const resultPath = path.join(config.logsDir, 'unity_test_results.json');
-  log.info('Unity Editor(MCP) EditMode 테스트 실행...');
+  log.info('Unity CLI EditMode 테스트 실행...');
+  const timeoutSec = Math.max(30, Math.ceil(config.unityTimeoutMs / 1000));
 
   try {
     throwIfAborted(signal, ABORT_MESSAGE);
-    return await withUnityEditor(
-      config,
-      async (session) => {
-        const wasPlaying = await stopPlayModeIfNeeded(session, config);
+    const wasPlaying = await stopPlayModeCli(config, signal);
+    try {
+      const started = await unityCommand(
+        config,
+        'run_tests',
+        ['--mode', 'editor', '--async_tests', 'true', '--timeout', String(timeoutSec)],
+        { timeoutMs: 60_000, signal },
+      );
+      writeLog(resultPath, JSON.stringify(started.payload ?? started.stdout, null, 2));
+      const immediate = parsePipelineTest(started.payload);
+      if (immediate.done) {
+        log.info(`테스트 결과: ${immediate.passed}/${immediate.total} 통과 (Unity CLI)`);
+        return { ...immediate, skipped: false, resultPath };
+      }
+
+      const deadline = Date.now() + config.unityTimeoutMs;
+      let last = immediate;
+      while (Date.now() < deadline) {
+        throwIfAborted(signal, ABORT_MESSAGE);
         try {
-          const started = await callUnityRole(session, 'runTests', {
-            mode: 'EditMode',
-            include_failed_tests: true,
-            include_details: true,
-          });
-          const jobId = pickJobId(started);
-          if (!jobId) {
-            return {
-              ok: false,
-              skipped: false,
-              total: 0,
-              passed: 0,
-              failed: 0,
-              failures: [],
-              resultPath,
-              failureReason: `run_tests 가 job_id 를 반환하지 않았습니다: ${JSON.stringify(started).slice(0, 400)}`,
-            };
+          const polled = await unityCommand(config, 'test_status', [], { timeoutMs: 30_000, signal });
+          writeLog(resultPath, JSON.stringify(polled.payload ?? polled.stdout, null, 2));
+          last = parsePipelineTest(polled.payload);
+          if (last.done) {
+            log.info(`테스트 결과: ${last.passed}/${last.total} 통과 (Unity CLI)`);
+            return { ...last, skipped: false, resultPath };
           }
-
-          const deadline = Date.now() + config.unityTimeoutMs;
-          let last: unknown = started;
-          while (Date.now() < deadline) {
-            throwIfAborted(signal, ABORT_MESSAGE);
-            const waitSec = Math.max(1, Math.min(60, Math.ceil((deadline - Date.now()) / 1000)));
-            last = await callUnityRole(session, 'getTestJob', {
-              job_id: jobId,
-              wait_timeout: waitSec,
-              include_failed_tests: true,
-              include_details: true,
-            });
-            writeLog(resultPath, JSON.stringify(last, null, 2));
-            const status = String(
-              (last as { status?: unknown; data?: { status?: unknown } })?.status ??
-                (last as { data?: { status?: unknown } })?.data?.status ??
-                '',
-            ).toLowerCase();
-            if (status === 'complete' || status === 'completed' || status === 'failed' || status === 'error') {
-              const parsed = parseMcpTestJob(last);
-              log.info(`테스트 결과: ${parsed.passed}/${parsed.total} 통과 (Editor / MCP)`);
-              return { ...parsed, skipped: false, resultPath };
-            }
-          }
-
-          return {
-            ok: false,
-            skipped: false,
-            total: 0,
-            passed: 0,
-            failed: 0,
-            failures: [],
-            resultPath,
-            failureReason: 'EditMode 테스트가 타임아웃되었습니다.',
-          };
-        } finally {
-          await restorePlayModeIfNeeded(session, wasPlaying, config);
+        } catch (error) {
+          if (isAbortError(error)) throw error;
+          if (!isTransientCliError(error)) throw error;
         }
-      },
-      signal,
-    );
+        await abortableSleep(2_000, signal);
+      }
+
+      return {
+        ok: false,
+        skipped: false,
+        total: last.total,
+        passed: last.passed,
+        failed: last.failed,
+        failures: last.failures,
+        resultPath,
+        failureReason: 'EditMode 테스트가 타임아웃되었습니다.',
+      };
+    } finally {
+      await restorePlayModeCli(config, wasPlaying, signal);
+    }
   } catch (error) {
+    if (isAbortError(error)) {
+      await unityCommand(config, 'cancel_tests', [], { timeoutMs: 10_000 }).catch(() => undefined);
+    }
     return {
       ok: false,
       skipped: false,

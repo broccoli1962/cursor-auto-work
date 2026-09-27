@@ -158,4 +158,42 @@ export class Notifier {
       fields,
     });
   }
+
+  autonomyCycle(cycle: number, maxCycles: number, goal: string): Promise<void> {
+    return this.send({
+      level: 'start',
+      title: `자율 개발 사이클 ${cycle}/${maxCycles}`,
+      description: goal,
+    });
+  }
+
+  autonomyReview(cycle: number, action: string, summary: string): Promise<void> {
+    const level = action === 'done' ? 'success' : action === 'revise' ? 'warning' : 'critical';
+    return this.send({
+      level,
+      title: `사이클 ${cycle} 검토: ${action}`,
+      description: summary || '(요약 없음)',
+    });
+  }
+
+  autonomyDone(goal: string, summary: string, completed: number, total: number, durationMs: number): Promise<void> {
+    return this.send({
+      level: 'success',
+      title: '자율 개발 목표 달성',
+      description: `${goal}\n\n${summary || '검토가 목표 달성을 확인했습니다.'}`,
+      fields: [
+        { name: '완료 Step', value: `${completed}/${total}`, inline: true },
+        { name: '총 소요 시간', value: `${Math.round(durationMs / 60_000)}분`, inline: true },
+      ],
+    });
+  }
+
+  autonomyBlocked(cycle: number, reason: string): Promise<void> {
+    return this.send({
+      level: 'critical',
+      title: `자율 개발 중단 - 사람 개입 필요 (사이클 ${cycle})`,
+      description: `\`\`\`\n${truncate(reason, 1500)}\n\`\`\``,
+      footer: '기획서와 state.json 을 확인한 뒤 다시 실행하세요. 사이클을 끄려면 AUTONOMY=false.',
+    });
+  }
 }

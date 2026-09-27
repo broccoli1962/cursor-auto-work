@@ -141,7 +141,7 @@ function buildArgs(
   if (config.cursorModel) args.push('--model', config.cursorModel);
   // 비대화형 판정/실행이 Workspace Trust 프롬프트에서 멈추지 않게 한다.
   args.push('--trust');
-  // UnityMCP 도구 호출 및 파일 쓰기를 사람 승인 없이 자율 수행하도록 허용
+  // 셸(Unity CLI)과 파일 쓰기를 사람 승인 없이 자율 수행하도록 허용
   if (options.yolo ?? config.cursorYolo) args.push('--force');
 
   return args;

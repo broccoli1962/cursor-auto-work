@@ -14,7 +14,7 @@
     "start": "node dist/index.js",
     "run:orchestrator": "node dist/index.js run",
     "clean": "rimraf dist",
-    "test": "tsx --test src/cliArgs.test.ts src/runLock.test.ts src/gitManager.test.ts src/memoryManager.test.ts src/stepVerifier.test.ts src/selectSteps.test.ts src/roadmap.test.ts src/unityMcpParse.test.ts src/processKill.test.ts src/inferVerify.test.ts src/unityAssetInspect.test.ts src/projectCommit.test.ts"
+    "test": "tsx --test src/cliArgs.test.ts src/config.test.ts src/runLock.test.ts src/gitManager.test.ts src/memoryManager.test.ts src/stepVerifier.test.ts src/selectSteps.test.ts src/roadmap.test.ts src/unityMcpParse.test.ts src/unityCli.test.ts src/processKill.test.ts src/inferVerify.test.ts src/unityAssetInspect.test.ts src/projectCommit.test.ts src/autonomy.test.ts src/playtest.test.ts src/playtestProbe.test.ts"
   },
   "engines": {
     "node": ">=18"

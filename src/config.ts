@@ -5,12 +5,12 @@ import path from 'node:path';
 import dotenv from 'dotenv';
 
 import { createLogger } from './logger';
-import { findUnityMcpEntry } from './mcpProbe';
 import type {
   CommitLanguage,
   LogLevel,
   OrchestratorConfig,
   PromptDelivery,
+  UnityInstallMode,
   UnityValidationBackend,
   ValidationMode,
 } from './types';
@@ -19,12 +19,94 @@ dotenv.config();
 
 const log = createLogger('config');
 
-const DEPRECATED_ENV_KEYS = [
-  'SKIP_VALIDATION',
-  'RUN_UNITY_COMPILE',
-  'RUN_UNITY_TESTS',
-  'CURSOR_SUBAGENT_MODEL',
+/** 오케스트레이터가 읽는 환경 변수. 여기 없으면 설정으로 쓰이지 않는다. */
+export const KNOWN_ENV_KEYS = [
+  'TARGET_PROJECT_PATH',
+  'UNITY_PATH',
+  'UNITY_CLI_BIN',
+  'UNITY_CLI_INSTALL',
+  'UNITY_PIPELINE_INSTALL',
+  'UNITY_VALIDATION_BACKEND',
+  'UNITY_LAUNCH_EDITOR',
+  'UNITY_LAUNCH_TIMEOUT_MS',
+  'UNITY_STOP_PLAY_MODE',
+  'UNITY_RESTORE_PLAY_MODE',
+  'CURSOR_AGENT_BIN',
+  'CURSOR_MODEL',
+  'CURSOR_YOLO',
+  'CURSOR_PROMPT_DELIVERY',
+  'DISCORD_WEBHOOK_URL',
+  'SPEC_PATH',
+  'ROADMAP_PATH',
+  'STATE_PATH',
+  'RUNTIME_DIR',
+  'MAX_RETRIES',
+  'AGENT_TIMEOUT_MS',
+  'UNITY_TIMEOUT_MS',
+  'VALIDATION_MODE',
+  'INFER_VERIFY',
+  'STEP_JUDGE',
+  'JUDGE_TIMEOUT_MS',
+  'AUTONOMY',
+  'AUTONOMY_BUDGET_MS',
+  'AUTONOMY_MAX_CYCLES',
+  'AUTONOMY_STEPS_PER_CYCLE',
+  'AUTONOMY_PLAYTEST',
+  'AUTONOMY_PLAYTEST_SETTLE_MS',
+  'AUTONOMY_PLAYTEST_RETRIES',
+  'AUTONOMY_REVIEW_TIMEOUT_MS',
+  'GOAL',
+  'GOAL_PATH',
+  'AUTONOMY_RESUME_SESSION',
+  'AUTONOMY_SESSION_STEPS',
+  'RESUME_ON_RETRY',
+  'ROLLBACK_ON_FAIL',
+  'CREATE_WORK_BRANCH',
+  'RULES_MAX_CHARS',
+  'SPEC_MAX_CHARS',
+  'AUTO_COMMIT',
+  'AUTO_PUSH',
+  'COMMIT_LANGUAGE',
+  'GIT_AUTHOR_NAME',
+  'GIT_AUTHOR_EMAIL',
+  'MAX_ERROR_LINES',
+  'LOG_LEVEL',
 ] as const;
+
+/** CLI 가 직접 읽는 키. 오케스트레이터 설정은 아니지만 지우면 안 된다. */
+const PASSTHROUGH_ENV_KEYS = ['CURSOR_API_KEY'] as const;
+
+/** 제거된 키와, 대신 쓸 곳. */
+export const REMOVED_ENV_KEYS: Record<string, string> = {
+  SKIP_VALIDATION: 'VALIDATION_MODE=skip',
+  RUN_UNITY_COMPILE: 'VALIDATION_MODE',
+  RUN_UNITY_TESTS: 'VALIDATION_MODE=full 과 roadmap 의 runTests',
+  CURSOR_SUBAGENT_MODEL: 'CURSOR_MODEL',
+  AUTONOMY_PLAYTEST_INPUT: '로드맵 Step 의 playtest.input',
+};
+
+const KNOWN_ENV_KEY_SET = new Set<string>([...KNOWN_ENV_KEYS, ...PASSTHROUGH_ENV_KEYS]);
+
+function looksLikeOrchestratorEnv(key: string): boolean {
+  return /^(TARGET_PROJECT_PATH|UNITY_|CURSOR_|DISCORD_WEBHOOK_URL|SPEC_PATH|ROADMAP_PATH|STATE_PATH|RUNTIME_DIR|MAX_RETRIES|MAX_ERROR_LINES|AGENT_TIMEOUT_MS|VALIDATION_MODE|INFER_VERIFY|STEP_JUDGE|JUDGE_|AUTONOMY|GOAL|RESUME_ON_RETRY|ROLLBACK_ON_FAIL|CREATE_WORK_BRANCH|RULES_MAX_CHARS|SPEC_MAX_CHARS|AUTO_COMMIT|AUTO_PUSH|COMMIT_LANGUAGE|GIT_AUTHOR_|LOG_LEVEL)/.test(
+    key,
+  );
+}
+
+/** .env 에 남은 죽은 키와, 접두사만 비슷하고 읽히지 않는 키를 가른다. */
+export function classifyOrchestratorEnv(keys: string[]): { removed: string[]; unknown: string[] } {
+  const removed: string[] = [];
+  const unknown: string[] = [];
+  for (const key of keys) {
+    if (REMOVED_ENV_KEYS[key]) {
+      removed.push(key);
+      continue;
+    }
+    if (!looksLikeOrchestratorEnv(key) || KNOWN_ENV_KEY_SET.has(key)) continue;
+    unknown.push(key);
+  }
+  return { removed, unknown };
+}
 
 function str(key: string, fallback = ''): string {
   const value = process.env[key];
@@ -50,10 +132,13 @@ function resolveIn(projectRoot: string, value: string): string {
 }
 
 function warnDeprecatedEnvVars(): void {
-  for (const key of DEPRECATED_ENV_KEYS) {
-    if (str(key)) {
-      log.warn(`${key} 은(는) 제거되었습니다. VALIDATION_MODE (lint|compile|full|skip) 를 사용하세요.`);
-    }
+  const present = Object.keys(process.env).filter((key) => str(key));
+  const { removed, unknown } = classifyOrchestratorEnv(present);
+  for (const key of removed) {
+    log.warn(`${key} 은(는) 더 이상 읽지 않습니다. 대신 ${REMOVED_ENV_KEYS[key]} 를 사용하고 .env 에서 이 줄을 지우세요.`);
+  }
+  for (const key of unknown) {
+    log.warn(`${key} 은(는) 오케스트레이터 설정이 아닙니다. .env 에서 지워도 동작이 바뀌지 않습니다.`);
   }
 }
 
@@ -74,6 +159,25 @@ function parseValidationMode(raw: string): ValidationMode {
   }
   log.warn(`알 수 없는 VALIDATION_MODE='${raw}' — compile 로 대체합니다.`);
   return 'compile';
+}
+
+function parseInstallMode(raw: string): UnityInstallMode {
+  const normalized = raw.toLowerCase();
+  if (normalized === 'yes' || normalized === 'true' || normalized === 'always') return 'yes';
+  if (normalized === 'no' || normalized === 'false' || normalized === 'never') return 'no';
+  return 'ask';
+}
+
+function parseUnityBackend(raw: string): UnityValidationBackend {
+  if (raw === 'batch') return 'batch';
+  if (raw === 'mcp') {
+    log.warn('UNITY_VALIDATION_BACKEND=mcp 는 Coplay UnityMCP 채널입니다. 공식 Unity CLI(cli)로 검수합니다.');
+    return 'cli';
+  }
+  if (raw && raw !== 'cli') {
+    log.warn(`알 수 없는 UNITY_VALIDATION_BACKEND='${raw}' — cli 로 대체합니다.`);
+  }
+  return 'cli';
 }
 
 export class ConfigError extends Error {}
@@ -99,11 +203,11 @@ export function describeValidationMode(config: OrchestratorConfig): string {
     case 'compile':
       return config.unityValidationBackend === 'batch'
         ? 'Verify + 린트 → 배치모드 컴파일' + judgeSuffix(config)
-        : 'Verify + 린트 → Editor 컴파일' + judgeSuffix(config);
+        : 'Verify + 린트 → Unity CLI 컴파일' + judgeSuffix(config);
     case 'full':
       return config.unityValidationBackend === 'batch'
         ? 'Verify + 린트 → 배치모드 컴파일 → 테스트' + judgeSuffix(config)
-        : 'Verify + 린트 → Editor 컴파일 → 테스트' + judgeSuffix(config);
+        : 'Verify + 린트 → Unity CLI 컴파일 → 테스트' + judgeSuffix(config);
     default:
       return config.validationMode;
   }
@@ -145,13 +249,17 @@ export function loadConfig(overrides: Partial<OrchestratorConfig> = {}): Orchest
   const validationMode =
     overrides.validationMode ?? parseValidationMode(str('VALIDATION_MODE', 'compile'));
 
-  const backendRaw = str('UNITY_VALIDATION_BACKEND', 'mcp').toLowerCase();
+  const backendRaw = str('UNITY_VALIDATION_BACKEND', 'cli').toLowerCase();
   const unityValidationBackend: UnityValidationBackend =
-    overrides.unityValidationBackend ?? (backendRaw === 'batch' ? 'batch' : 'mcp');
+    overrides.unityValidationBackend ?? parseUnityBackend(backendRaw);
 
   const config: OrchestratorConfig = {
     targetProjectPath,
     unityPath: overrides.unityPath ?? str('UNITY_PATH'),
+    unityCliBin: overrides.unityCliBin ?? str('UNITY_CLI_BIN', 'unity'),
+    unityCliInstall: overrides.unityCliInstall ?? parseInstallMode(str('UNITY_CLI_INSTALL', 'ask')),
+    unityPipelineInstall:
+      overrides.unityPipelineInstall ?? parseInstallMode(str('UNITY_PIPELINE_INSTALL', 'ask')),
     cursorAgentBin: overrides.cursorAgentBin ?? str('CURSOR_AGENT_BIN', 'agent'),
     cursorModel: overrides.cursorModel ?? str('CURSOR_MODEL'),
     cursorYolo: overrides.cursorYolo ?? bool('CURSOR_YOLO', true),
@@ -183,7 +291,28 @@ export function loadConfig(overrides: Partial<OrchestratorConfig> = {}): Orchest
     inferVerify: overrides.inferVerify ?? bool('INFER_VERIFY', true),
     stepJudge: overrides.stepJudge ?? bool('STEP_JUDGE', true),
     judgeTimeoutMs: overrides.judgeTimeoutMs ?? num('JUDGE_TIMEOUT_MS', 3 * 60 * 1000),
+    autonomyEnabled: overrides.autonomyEnabled ?? bool('AUTONOMY', true),
+    goal: overrides.goal ?? str('GOAL'),
+    goalPath: resolveIn(targetProjectPath, overrides.goalPath ?? str('GOAL_PATH', './docs/goal.md')),
+    autonomyMaxCycles: Math.max(1, Math.floor(overrides.autonomyMaxCycles ?? num('AUTONOMY_MAX_CYCLES', 48))),
+    autonomyBudgetMs: Math.max(60_000, overrides.autonomyBudgetMs ?? num('AUTONOMY_BUDGET_MS', 4 * 60 * 60 * 1000)),
+    autonomyStepsPerCycle: Math.max(
+      1,
+      Math.floor(overrides.autonomyStepsPerCycle ?? num('AUTONOMY_STEPS_PER_CYCLE', 1)),
+    ),
+    playtest: overrides.playtest ?? bool('AUTONOMY_PLAYTEST', true),
+    playtestSettleMs: Math.max(0, overrides.playtestSettleMs ?? num('AUTONOMY_PLAYTEST_SETTLE_MS', 2_000)),
+    playtestRetries: Math.max(1, Math.floor(overrides.playtestRetries ?? num('AUTONOMY_PLAYTEST_RETRIES', 3))),
+    autonomyReviewTimeoutMs: Math.max(
+      1000,
+      overrides.autonomyReviewTimeoutMs ?? num('AUTONOMY_REVIEW_TIMEOUT_MS', 10 * 60 * 1000),
+    ),
     resumeOnRetry: overrides.resumeOnRetry ?? bool('RESUME_ON_RETRY', true),
+    autonomyResumeSession: overrides.autonomyResumeSession ?? bool('AUTONOMY_RESUME_SESSION', true),
+    autonomySessionSteps: Math.max(
+      1,
+      Math.floor(overrides.autonomySessionSteps ?? num('AUTONOMY_SESSION_STEPS', 4)),
+    ),
     rollbackOnFail: overrides.rollbackOnFail ?? bool('ROLLBACK_ON_FAIL', true),
     createWorkBranch: overrides.createWorkBranch ?? bool('CREATE_WORK_BRANCH', true),
     rulesMaxChars: overrides.rulesMaxChars ?? num('RULES_MAX_CHARS', 40_000),
@@ -254,16 +383,6 @@ export function validateConfig(config: OrchestratorConfig): ValidationIssue[] {
       fatal: needsUnityPath,
       message: `UNITY_PATH 실행 파일을 찾을 수 없습니다: ${config.unityPath}`,
     });
-  }
-
-  if (needsUnity(config) && config.unityValidationBackend === 'mcp') {
-    if (!findUnityMcpEntry(config.targetProjectPath)) {
-      issues.push({
-        fatal: true,
-        message:
-          'VALIDATION_MODE=compile/full 은 열린 Unity Editor + UnityMCP 로 검수합니다. mcp.json 에 UnityMCP 를 등록하고 에디터를 실행해 두세요. (구 배치모드는 UNITY_VALIDATION_BACKEND=batch)',
-      });
-    }
   }
 
   if (!fs.existsSync(config.roadmapPath)) {

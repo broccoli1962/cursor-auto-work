@@ -142,7 +142,7 @@ describe('infer prefab/addressable', () => {
     const checks = inferVerifyChecks({
       id: 4,
       title: 'menu',
-      task: "UnityMCP 를 사용해 MainMenu 프리팹을 생성하고, Addressables 그룹 'UI' 에 'ui/main_menu' 주소로 등록한다.",
+      task: "Unity CLI 로 MainMenu 프리팹을 생성하고, Addressables 그룹 'UI' 에 'ui/main_menu' 주소로 등록한다.",
       acceptanceCriteria: ['MainMenu 프리팹이 Addressables 그룹 UI 에 등록되어 있다'],
       targetFiles: ['Assets/Prefabs/UI', 'Assets/Prefabs/UI/MainMenu.prefab'],
     });
